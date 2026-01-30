@@ -136,23 +136,60 @@ def save_enriched_leads(
 
 
 def generate_signal_summary(signals: List[Dict]) -> Dict:
-    """Generate summary statistics for extracted signals."""
+    """
+    Generate summary statistics for extracted signals.
+    
+    Tri-State Signal Semantics:
+    - true  = Confidently observed
+    - false = Confidently absent
+    - null  = Unknown / not determinable
+    
+    HVAC Signal Interpretation:
+    - Phone = PRIMARY booking mechanism
+    - Contact form = Inbound readiness
+    - Automated scheduling = Ops maturity (not booking requirement)
+    - Reviews = Business activity indicator
+    """
     total = len(signals)
     if total == 0:
         return {}
     
-    # Website signals
-    has_website = sum(1 for s in signals if s.get("has_website"))
-    website_accessible = sum(1 for s in signals if s.get("website_accessible"))
-    has_ssl = sum(1 for s in signals if s.get("has_ssl"))
-    mobile_friendly = sum(1 for s in signals if s.get("mobile_friendly"))
-    has_contact_form = sum(1 for s in signals if s.get("has_contact_form"))
-    has_booking = sum(1 for s in signals if s.get("has_booking"))
+    # Helper to count tri-state values
+    def count_true(key):
+        return sum(1 for s in signals if s.get(key) is True)
     
-    # Phone signals
-    has_phone = sum(1 for s in signals if s.get("has_phone"))
+    def count_false(key):
+        return sum(1 for s in signals if s.get(key) is False)
     
-    # Review signals
+    def count_null(key):
+        return sum(1 for s in signals if s.get(key) is None)
+    
+    # Phone signals - PRIMARY booking mechanism for HVAC
+    has_phone = count_true("has_phone")
+    
+    # Website signals (tri-state aware)
+    has_website = count_true("has_website")
+    website_accessible_true = count_true("website_accessible")
+    website_accessible_null = count_null("website_accessible")
+    has_ssl = count_true("has_ssl")
+    mobile_friendly = count_true("mobile_friendly")
+    has_trust_badges = count_true("has_trust_badges")
+    
+    # Inbound readiness - Contact Form (AGENCY-SAFE: false is rare)
+    has_contact_form_true = count_true("has_contact_form")
+    has_contact_form_false = count_false("has_contact_form")
+    has_contact_form_null = count_null("has_contact_form")
+    
+    # Email (NEVER false - may exist elsewhere)
+    has_email_true = count_true("has_email")
+    has_email_null = count_null("has_email")
+    
+    # Operational maturity (tri-state - false is OK for scheduling)
+    has_automated_scheduling_true = count_true("has_automated_scheduling")
+    has_automated_scheduling_false = count_false("has_automated_scheduling")
+    has_automated_scheduling_null = count_null("has_automated_scheduling")
+    
+    # Review signals - business activity indicator
     has_reviews = sum(1 for s in signals if s.get("review_count", 0) > 0)
     ratings = [s["rating"] for s in signals if s.get("rating") is not None]
     review_counts = [s["review_count"] for s in signals if s.get("review_count")]
@@ -164,23 +201,59 @@ def generate_signal_summary(signals: List[Dict]) -> Dict:
         if s.get("last_review_days_ago") is not None
     ]
     
+    # Active businesses: >5 reviews AND last review <365 days ago
+    active_businesses = sum(
+        1 for s in signals 
+        if s.get("review_count", 0) > 5 
+        and s.get("last_review_days_ago") is not None 
+        and s.get("last_review_days_ago") < 365
+    )
+    
+    # Booking capable: has phone (primary HVAC booking mechanism)
+    booking_capable = has_phone
+    
+    # Manual ops (opportunity): explicitly false (analyzed, no scheduling found)
+    # null means unknown, so we don't count those as opportunities
+    manual_ops_confirmed = has_automated_scheduling_false
+    
     return {
         "total_leads": total,
+        "booking": {
+            "has_phone": has_phone,
+            "has_phone_pct": round(has_phone / total * 100, 1),
+            "booking_capable": booking_capable,
+            "booking_capable_pct": round(booking_capable / total * 100, 1),
+        },
+        "inbound_readiness": {
+            "contact_form_true": has_contact_form_true,
+            "contact_form_true_pct": round(has_contact_form_true / total * 100, 1),
+            "contact_form_false": has_contact_form_false,
+            "contact_form_unknown": has_contact_form_null,
+            "email_found": has_email_true,
+            "email_found_pct": round(has_email_true / total * 100, 1),
+            "email_unknown": has_email_null,
+        },
+        "ops_maturity": {
+            "automated": has_automated_scheduling_true,
+            "automated_pct": round(has_automated_scheduling_true / total * 100, 1),
+            "manual_confirmed": manual_ops_confirmed,
+            "manual_confirmed_pct": round(manual_ops_confirmed / total * 100, 1),
+            "unknown": has_automated_scheduling_null,
+        },
         "website": {
             "has_website": has_website,
             "has_website_pct": round(has_website / total * 100, 1),
-            "accessible": website_accessible,
+            "accessible": website_accessible_true,
+            "not_accessible": count_false("website_accessible"),
+            "unknown": website_accessible_null,
             "has_ssl": has_ssl,
             "mobile_friendly": mobile_friendly,
-            "has_contact_form": has_contact_form,
-            "has_booking": has_booking,
+            "has_trust_badges": has_trust_badges,
         },
-        "phone": {
-            "has_phone": has_phone,
-            "has_phone_pct": round(has_phone / total * 100, 1),
-        },
-        "reviews": {
+        "activity": {
             "has_reviews": has_reviews,
+            "active_businesses": active_businesses,
+            "active_pct": round(active_businesses / total * 100, 1),
             "avg_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
             "avg_review_count": round(sum(review_counts) / len(review_counts), 1) if review_counts else None,
             "avg_days_since_review": round(sum(days_since_review) / len(days_since_review), 1) if days_since_review else None,
@@ -252,23 +325,42 @@ def run_enrichment_pipeline(
     summary = generate_signal_summary(signals)
     
     logger.info("\n" + "=" * 60)
-    logger.info("SIGNAL EXTRACTION SUMMARY")
+    logger.info("SIGNAL EXTRACTION SUMMARY (HVAC Model + Tri-State)")
     logger.info("=" * 60)
     logger.info(f"Total leads processed: {summary['total_leads']}")
-    logger.info("\nWebsite Signals:")
+    logger.info("  (true=observed, false=absent, null=unknown)")
+    
+    logger.info("\n📞 Booking Capability (Phone = Primary for HVAC):")
+    logger.info(f"  Has phone: {summary['booking']['has_phone']} ({summary['booking']['has_phone_pct']}%)")
+    logger.info(f"  Booking capable: {summary['booking']['booking_capable']} ({summary['booking']['booking_capable_pct']}%)")
+    
+    logger.info("\n📝 Inbound Readiness (AGENCY-SAFE):")
+    logger.info(f"  Contact Form:")
+    logger.info(f"    ✓ True (found): {summary['inbound_readiness']['contact_form_true']} ({summary['inbound_readiness']['contact_form_true_pct']}%)")
+    logger.info(f"    ✗ False (explicit absence): {summary['inbound_readiness']['contact_form_false']}")
+    logger.info(f"    ? Unknown: {summary['inbound_readiness']['contact_form_unknown']}")
+    logger.info(f"  Email:")
+    logger.info(f"    ✓ Found: {summary['inbound_readiness']['email_found']} ({summary['inbound_readiness']['email_found_pct']}%)")
+    logger.info(f"    ? Unknown: {summary['inbound_readiness']['email_unknown']} (never false)")
+    
+    logger.info("\n⚙️ Ops Maturity (Automated Scheduling):")
+    logger.info(f"  ✓ Automated: {summary['ops_maturity']['automated']} ({summary['ops_maturity']['automated_pct']}%)")
+    logger.info(f"  ✗ Manual (confirmed opportunity): {summary['ops_maturity']['manual_confirmed']} ({summary['ops_maturity']['manual_confirmed_pct']}%)")
+    logger.info(f"  ? Unknown: {summary['ops_maturity']['unknown']}")
+    
+    logger.info("\n🌐 Website:")
     logger.info(f"  Has website: {summary['website']['has_website']} ({summary['website']['has_website_pct']}%)")
-    logger.info(f"  Accessible: {summary['website']['accessible']}")
+    logger.info(f"  Accessible: {summary['website']['accessible']} | Not accessible: {summary['website']['not_accessible']} | Unknown: {summary['website']['unknown']}")
     logger.info(f"  Has SSL: {summary['website']['has_ssl']}")
     logger.info(f"  Mobile friendly: {summary['website']['mobile_friendly']}")
-    logger.info(f"  Has contact form: {summary['website']['has_contact_form']}")
-    logger.info(f"  Has booking widget: {summary['website']['has_booking']}")
-    logger.info("\nPhone Signals:")
-    logger.info(f"  Has phone: {summary['phone']['has_phone']} ({summary['phone']['has_phone_pct']}%)")
-    logger.info("\nReview Signals:")
-    logger.info(f"  Has reviews: {summary['reviews']['has_reviews']}")
-    logger.info(f"  Avg rating: {summary['reviews']['avg_rating']}")
-    logger.info(f"  Avg review count: {summary['reviews']['avg_review_count']}")
-    logger.info(f"  Avg days since review: {summary['reviews']['avg_days_since_review']}")
+    logger.info(f"  Has trust badges: {summary['website']['has_trust_badges']}")
+    
+    logger.info("\n⭐ Business Activity:")
+    logger.info(f"  Has reviews: {summary['activity']['has_reviews']}")
+    logger.info(f"  Active businesses: {summary['activity']['active_businesses']} ({summary['activity']['active_pct']}%)")
+    logger.info(f"  Avg rating: {summary['activity']['avg_rating']}")
+    logger.info(f"  Avg review count: {summary['activity']['avg_review_count']}")
+    logger.info(f"  Avg days since review: {summary['activity']['avg_days_since_review']}")
     
     # Step 5: Save results
     output_path = save_enriched_leads(

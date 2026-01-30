@@ -150,9 +150,10 @@ def run_small_test():
         final_leads.append(merged)
         
         logger.info(f"  ✓ {lead['name'][:40]}")
-        logger.info(f"    SSL: {signals.get('has_ssl')} | Mobile: {signals.get('mobile_friendly')} | Form: {signals.get('has_contact_form')}")
-        logger.info(f"    Phone: {signals.get('phone_number', 'None')}")
-        logger.info(f"    Rating: {signals.get('rating')} | Reviews: {signals.get('review_count')}")
+        logger.info(f"    📞 Phone: {signals.get('phone_number') or 'null'}")
+        logger.info(f"    📝 Contact Form: {signals.get('has_contact_form')} | Email: {signals.get('has_email')}")
+        logger.info(f"    ⚙️ Auto-scheduling: {signals.get('has_automated_scheduling')} | Trust: {signals.get('has_trust_badges')}")
+        logger.info(f"    ⭐ Rating: {signals.get('rating')} | Reviews: {signals.get('review_count')}")
     
     # =========================================
     # Step 5: Save results

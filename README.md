@@ -156,34 +156,56 @@ lead-scoring-engine/
 
 ### Enriched Lead Signals (Step 4)
 
+**HVAC Signal Model:** Phone is the PRIMARY booking mechanism. Automated scheduling indicates operational maturity, not booking capability.
+
 | Signal | Type | Description |
 |--------|------|-------------|
+| `signal_has_phone` | bool | **PRIMARY booking signal** |
+| `signal_phone_number` | string | International format |
 | `signal_has_website` | bool | Has a website |
 | `signal_website_url` | string | Full URL |
 | `signal_domain` | string | Normalized domain |
 | `signal_has_ssl` | bool | Uses HTTPS |
 | `signal_mobile_friendly` | bool | Has viewport meta tag |
-| `signal_has_contact_form` | bool | Form detected |
-| `signal_has_booking` | bool | Booking widget detected |
+| `signal_has_contact_form` | bool | Inbound lead readiness |
+| `signal_has_automated_scheduling` | bool | Ops maturity (see below) |
 | `signal_page_load_time_ms` | int | Response time |
-| `signal_has_phone` | bool | Has phone number |
-| `signal_phone_number` | string | International format |
 | `signal_rating` | float | Google rating |
 | `signal_review_count` | int | Total reviews |
 | `signal_last_review_days_ago` | int | Days since last review |
 
-## Booking Widgets Detected
+## HVAC Signal Interpretation
 
-- Calendly
-- Setmore
-- Square Appointments
-- Acuity Scheduling
-- Booksy
-- Vagaro
-- Schedulicity
+```
+IF has_phone AND review_count > 5:
+    lead_status = "Active HVAC business"
+
+IF has_contact_form:
+    inbound_ready = true
+
+IF has_automated_scheduling:
+    ops_type = "Automated"      # Mature ops, possibly agency-saturated
+ELSE:
+    ops_type = "Manual"         # Higher optimization opportunity
+```
+
+**Key Insight:** Lack of automated scheduling ≠ weak lead. It indicates manual operations and higher opportunity for optimization services.
+
+## Automated Scheduling Systems Detected
+
+Field Service Management (HVAC-specific):
+- ServiceTitan
 - HouseCall Pro
 - Jobber
-- ServiceTitan
+- FieldEdge
+- SuccessWare
+
+General Scheduling:
+- Calendly
+- Acuity Scheduling
+- Square Appointments
+- Setmore
+- Schedulicity
 
 ## API Usage Estimation
 
