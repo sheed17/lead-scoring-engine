@@ -2,11 +2,13 @@
 """
 Small-scale test pipeline for development and testing.
 
-Makes minimal API calls to verify the full pipeline works:
-- 1 grid point (city center only)
-- 1 keyword
-- 1 page (no pagination)
-- 3 leads enriched max
+Runs the FULL pipeline with minimal API calls:
+1. Fetch nearby places (1 search)
+2. Normalize & deduplicate
+3. Enrich with Place Details (3 leads)
+4. Extract signals
+5. Score leads (NEW)
+6. Save results
 
 Expected API calls: ~4 total
 - 1 Nearby Search call (~$0.032)
@@ -31,6 +33,7 @@ from pipeline.fetch import PlacesFetcher
 from pipeline.normalize import normalize_place, deduplicate_places
 from pipeline.enrich import PlaceDetailsEnricher
 from pipeline.signals import extract_signals, merge_signals_into_lead
+from pipeline.score import score_lead, get_scoring_summary
 
 # Configure logging
 logging.basicConfig(
@@ -156,9 +159,31 @@ def run_small_test():
         logger.info(f"    ⭐ Rating: {signals.get('rating')} | Reviews: {signals.get('review_count')}")
     
     # =========================================
-    # Step 5: Save results
+    # Step 5: Score leads
     # =========================================
-    logger.info("\n[Step 5] Saving results...")
+    logger.info("\n[Step 5] Scoring leads...")
+    
+    scored_leads = []
+    for lead in final_leads:
+        result = score_lead(lead)
+        lead["lead_score"] = result.lead_score
+        lead["priority"] = result.priority
+        lead["confidence"] = result.confidence
+        lead["reasons"] = result.reasons
+        scored_leads.append(lead)
+        
+        logger.info(f"  ✓ {lead['name'][:40]}")
+        logger.info(f"    Score: {result.lead_score} | Priority: {result.priority} | Confidence: {result.confidence}")
+        rs = result.review_summary
+        logger.info(f"    Reviews: {rs['review_count']} ({rs['volume']}) | Last: {rs['last_review_text']} ({rs['freshness']})")
+        logger.info(f"    Reasons: {', '.join(result.reasons[:2])}...")
+    
+    final_leads = scored_leads
+    
+    # =========================================
+    # Step 6: Save results
+    # =========================================
+    logger.info("\n[Step 6] Saving results...")
     
     os.makedirs(os.path.dirname(TEST_CONFIG["output_file"]), exist_ok=True)
     
@@ -196,12 +221,20 @@ def run_small_test():
     logger.info(f"Leads processed: {len(final_leads)}")
     logger.info(f"Output file: {TEST_CONFIG['output_file']}")
     
+    # Print scoring summary
+    if final_leads:
+        summary = get_scoring_summary(final_leads)
+        logger.info(f"\nScoring Summary:")
+        logger.info(f"  Avg Score: {summary['score']['avg']}")
+        logger.info(f"  🔥 High: {summary['priority']['high']} | 🟡 Medium: {summary['priority']['medium']} | ⚪ Low: {summary['priority']['low']}")
+    
     # Print one full example
     if final_leads:
         logger.info("\n" + "-" * 60)
         logger.info("SAMPLE OUTPUT (first lead):")
         logger.info("-" * 60)
-        sample = {k: v for k, v in final_leads[0].items() if k.startswith('signal_') or k in ['place_id', 'name', 'address']}
+        sample = {k: v for k, v in final_leads[0].items() 
+                  if k.startswith('signal_') or k in ['place_id', 'name', 'address', 'lead_score', 'priority', 'confidence', 'reasons']}
         print(json.dumps(sample, indent=2, default=str))
     
     return final_leads
