@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Test the scoring model with sample leads.
+Test the Opportunity Intelligence system with sample leads.
 
-No API calls. No pipeline. Just scoring logic validation.
+No API calls. No pipeline. Just opportunity + scoring logic validation.
 
 Usage:
     python scripts/test_scoring.py
@@ -23,113 +23,115 @@ from pipeline.score import score_lead, get_scoring_summary
 # =============================================================================
 
 SAMPLE_LEADS = [
-    # --- ELITE CANDIDATE (should score 100) ---
+    # --- PAID TRAFFIC LEAKAGE ---
     {
-        "name": "🏆 Elite HVAC Lead",
-        "description": "Perfect: manual, stale reviews, all contact paths, high confidence",
+        "name": "Ads Running, No Conversion",
+        "description": "Running Google Ads but no contact form, no scheduling",
         "signal_has_website": True,
         "signal_website_accessible": True,
-        "signal_has_phone": True,
-        "signal_has_contact_form": True,
-        "signal_has_email": True,
-        "signal_has_automated_scheduling": False,
-        "signal_has_trust_badges": False,
-        "signal_review_count": 25,
-        "signal_last_review_days_ago": 200,
-        "signal_rating": 4.5,
-    },
-    # --- HIGH BUT NOT ELITE ---
-    {
-        "name": "Strong Lead - Fresh Reviews",
-        "description": "Great signals but fresh reviews = not elite",
-        "signal_has_website": True,
-        "signal_website_accessible": True,
-        "signal_has_phone": True,
-        "signal_has_contact_form": True,
-        "signal_has_email": True,
-        "signal_has_automated_scheduling": False,
-        "signal_has_trust_badges": False,
-        "signal_review_count": 40,
-        "signal_last_review_days_ago": 15,  # Fresh = can't be 100
-        "signal_rating": 4.8,
-    },
-    {
-        "name": "Strong Lead - Low Confidence",
-        "description": "Good signals but missing data = capped",
-        "signal_has_website": True,
-        "signal_website_accessible": True,
-        "signal_has_phone": True,
-        "signal_has_contact_form": True,
-        "signal_has_email": None,  # Unknown
-        "signal_has_automated_scheduling": None,  # Unknown
-        "signal_has_trust_badges": None,
-        "signal_review_count": 30,
-        "signal_last_review_days_ago": 120,
-        "signal_rating": 4.6,
-    },
-    # --- ALREADY OPTIMIZED ---
-    {
-        "name": "Automated Business",
-        "description": "Uses ServiceTitan - already optimized, penalties apply",
-        "signal_has_website": True,
-        "signal_website_accessible": True,
-        "signal_has_phone": True,
-        "signal_has_contact_form": True,
-        "signal_has_email": True,
-        "signal_has_automated_scheduling": True,  # -5 penalty
-        "signal_has_trust_badges": True,  # -3 penalty
-        "signal_review_count": 85,
-        "signal_last_review_days_ago": 10,  # Fresh
-        "signal_rating": 4.9,
-    },
-    # --- LARGE BRAND (CAPPED) ---
-    {
-        "name": "Big Brand HVAC",
-        "description": "200+ reviews = capped at 92",
-        "signal_has_website": True,
-        "signal_website_accessible": True,
-        "signal_has_phone": True,
-        "signal_has_contact_form": True,
-        "signal_has_email": True,
-        "signal_has_automated_scheduling": False,
-        "signal_has_trust_badges": True,
-        "signal_review_count": 350,
-        "signal_last_review_days_ago": 5,
-        "signal_rating": 4.7,
-    },
-    {
-        "name": "Medium Brand HVAC",
-        "description": "100+ reviews = capped at 95",
-        "signal_has_website": True,
-        "signal_website_accessible": True,
-        "signal_has_phone": True,
-        "signal_has_contact_form": True,
-        "signal_has_email": True,
-        "signal_has_automated_scheduling": False,
-        "signal_has_trust_badges": False,
-        "signal_review_count": 150,
-        "signal_last_review_days_ago": 45,
-        "signal_rating": 4.6,
-    },
-    # --- SMALL/UNDERSERVED ---
-    {
-        "name": "Phone Only Business",
-        "description": "No website, just phone - common for small HVAC",
-        "signal_has_website": False,
-        "signal_website_accessible": False,
         "signal_has_phone": True,
         "signal_has_contact_form": False,
         "signal_has_email": False,
         "signal_has_automated_scheduling": False,
         "signal_has_trust_badges": False,
-        "signal_review_count": 8,
-        "signal_last_review_days_ago": 300,
-        "signal_rating": 4.2,
+        "signal_runs_paid_ads": True,
+        "signal_paid_ads_channels": ["google"],
+        "signal_hiring_active": False,
+        "signal_hiring_roles": None,
+        "signal_review_count": 35,
+        "signal_last_review_days_ago": 45,
+        "signal_rating": 4.5,
+        "signal_review_velocity_30d": 1,
+        "signal_rating_delta_60d": None,
     },
-    # --- LOW CONFIDENCE ---
+    # --- OPERATIONAL SCALING PRESSURE ---
+    {
+        "name": "Growing HVAC Co - Hiring + Manual",
+        "description": "Hiring technicians, no automation, strong reviews",
+        "signal_has_website": True,
+        "signal_website_accessible": True,
+        "signal_has_phone": True,
+        "signal_has_contact_form": True,
+        "signal_has_email": True,
+        "signal_has_automated_scheduling": False,
+        "signal_has_trust_badges": False,
+        "signal_runs_paid_ads": False,
+        "signal_paid_ads_channels": None,
+        "signal_hiring_active": True,
+        "signal_hiring_roles": ["technician", "front_desk"],
+        "signal_review_count": 65,
+        "signal_last_review_days_ago": 12,
+        "signal_rating": 4.7,
+        "signal_review_velocity_30d": 3,
+        "signal_rating_delta_60d": 0.2,
+    },
+    # --- REPUTATION RECOVERY ---
+    {
+        "name": "Stale Reviews HVAC",
+        "description": "Very stale reviews, low count, declining rating",
+        "signal_has_website": True,
+        "signal_website_accessible": True,
+        "signal_has_phone": True,
+        "signal_has_contact_form": None,  # Unknown
+        "signal_has_email": None,
+        "signal_has_automated_scheduling": False,
+        "signal_has_trust_badges": False,
+        "signal_runs_paid_ads": False,
+        "signal_paid_ads_channels": None,
+        "signal_hiring_active": False,
+        "signal_hiring_roles": None,
+        "signal_review_count": 8,
+        "signal_last_review_days_ago": 280,
+        "signal_rating": 3.8,
+        "signal_review_velocity_30d": 0,
+        "signal_rating_delta_60d": -0.5,
+    },
+    # --- DIGITAL PRESENCE GAP ---
+    {
+        "name": "Phone-Only HVAC",
+        "description": "Active business with no website at all",
+        "signal_has_website": False,
+        "signal_website_accessible": False,
+        "signal_has_phone": True,
+        "signal_has_contact_form": None,
+        "signal_has_email": None,
+        "signal_has_automated_scheduling": None,
+        "signal_has_trust_badges": None,
+        "signal_runs_paid_ads": None,
+        "signal_paid_ads_channels": None,
+        "signal_hiring_active": None,
+        "signal_hiring_roles": None,
+        "signal_review_count": 22,
+        "signal_last_review_days_ago": 90,
+        "signal_rating": 4.3,
+        "signal_review_velocity_30d": None,
+        "signal_rating_delta_60d": None,
+    },
+    # --- ALREADY OPTIMIZED ---
+    {
+        "name": "Fully Optimized Big Brand",
+        "description": "Has everything, automated, 200+ reviews - low opportunity",
+        "signal_has_website": True,
+        "signal_website_accessible": True,
+        "signal_has_phone": True,
+        "signal_has_contact_form": True,
+        "signal_has_email": True,
+        "signal_has_automated_scheduling": True,
+        "signal_has_trust_badges": True,
+        "signal_runs_paid_ads": True,
+        "signal_paid_ads_channels": ["google", "meta"],
+        "signal_hiring_active": False,
+        "signal_hiring_roles": None,
+        "signal_review_count": 350,
+        "signal_last_review_days_ago": 3,
+        "signal_rating": 4.9,
+        "signal_review_velocity_30d": 5,
+        "signal_rating_delta_60d": 0.1,
+    },
+    # --- MINIMAL DATA ---
     {
         "name": "Minimal Data Lead",
-        "description": "Most signals unknown - confidence dampens score",
+        "description": "Almost everything unknown - low confidence",
         "signal_has_website": True,
         "signal_website_accessible": None,
         "signal_has_phone": True,
@@ -137,11 +139,17 @@ SAMPLE_LEADS = [
         "signal_has_email": None,
         "signal_has_automated_scheduling": None,
         "signal_has_trust_badges": None,
+        "signal_runs_paid_ads": None,
+        "signal_paid_ads_channels": None,
+        "signal_hiring_active": None,
+        "signal_hiring_roles": None,
         "signal_review_count": None,
         "signal_last_review_days_ago": None,
         "signal_rating": None,
+        "signal_review_velocity_30d": None,
+        "signal_rating_delta_60d": None,
     },
-    # --- DISQUALIFIED ---
+    # --- UNREACHABLE ---
     {
         "name": "Unreachable Business",
         "description": "No contact methods at all - disqualified",
@@ -152,16 +160,22 @@ SAMPLE_LEADS = [
         "signal_has_email": False,
         "signal_has_automated_scheduling": False,
         "signal_has_trust_badges": False,
+        "signal_runs_paid_ads": False,
+        "signal_paid_ads_channels": None,
+        "signal_hiring_active": False,
+        "signal_hiring_roles": None,
         "signal_review_count": 3,
         "signal_last_review_days_ago": 400,
         "signal_rating": 3.5,
+        "signal_review_velocity_30d": 0,
+        "signal_rating_delta_60d": None,
     },
 ]
 
 
 def main():
     print("=" * 70)
-    print("SCORING MODEL TEST")
+    print("OPPORTUNITY INTELLIGENCE TEST")
     print("=" * 70)
     print("\nTesting with sample leads (no API calls)\n")
     
@@ -170,36 +184,35 @@ def main():
     for lead in SAMPLE_LEADS:
         result = score_lead(lead)
         
-        # Store for summary
         scored_lead = lead.copy()
         scored_lead.update(result.to_dict())
         scored_leads.append(scored_lead)
         
         # Display result
         print("-" * 70)
-        print(f"📍 {lead['name']}")
-        print(f"   {lead.get('description', '')}")
+        print(f"  {lead['name']}")
+        print(f"  {lead.get('description', '')}")
         print()
-        print(f"   Score: {result.lead_score} | Priority: {result.priority} | Confidence: {result.confidence}")
+        print(f"  Priority: {result.priority} | Score: {result.lead_score} | Confidence: {result.confidence}")
         print()
+        
+        # Opportunities (PRIMARY output)
+        if result.opportunities:
+            print(f"  Opportunities Detected ({len(result.opportunities)}):")
+            for opp in result.opportunities:
+                print(f"    [{opp['strength']}] [{opp['timing']}] {opp['type']}")
+                for ev in opp["evidence"]:
+                    print(f"      - {ev}")
+                print(f"      (confidence: {opp['confidence']})")
+            print()
+        else:
+            print("  No strong opportunities detected")
+            print()
         
         # Review summary
         rs = result.review_summary
-        print(f"   📊 Reviews: {rs['review_count'] or 'N/A'} ({rs['volume']}) | Rating: {rs['rating'] or 'N/A'}")
-        print(f"   📅 Last Review: {rs['last_review_text']} ({rs['freshness']})")
-        print()
-        
-        print("   Reasons:")
-        for reason in result.reasons:
-            print(f"     • {reason}")
-        print()
-        
-        # Show input signals for debugging
-        print("   Input Signals:")
-        for key, value in lead.items():
-            if key.startswith("signal_"):
-                signal_name = key[7:]
-                print(f"     {signal_name}: {json.dumps(value)}")
+        print(f"  Reviews: {rs['review_count'] or 'N/A'} ({rs['volume']}) | Rating: {rs['rating'] or 'N/A'}")
+        print(f"  Last Review: {rs['last_review_text']} ({rs['freshness']})")
         print()
     
     # Summary
@@ -209,38 +222,27 @@ def main():
     
     summary = get_scoring_summary(scored_leads)
     
-    # Score distribution buckets
-    scores = [l.get("lead_score", 0) for l in scored_leads]
-    elite_100 = sum(1 for s in scores if s == 100)
-    very_strong = sum(1 for s in scores if 95 <= s < 100)
-    strong = sum(1 for s in scores if 90 <= s < 95)
-    solid = sum(1 for s in scores if 80 <= s < 90)
-    below_80 = sum(1 for s in scores if s < 80)
+    print(f"\nPriority Breakdown:")
+    print(f"  High:   {summary['priority']['high']} ({summary['priority']['high_pct']}%)")
+    print(f"  Medium: {summary['priority']['medium']} ({summary['priority']['medium_pct']}%)")
+    print(f"  Low:    {summary['priority']['low']} ({summary['priority']['low_pct']}%)")
     
-    print(f"\n📊 Score Distribution:")
-    print(f"  🏆 100 (Elite):      {elite_100}")
-    print(f"  ⭐ 95-99 (Very Strong): {very_strong}")
-    print(f"  💪 90-94 (Strong):   {strong}")
-    print(f"  ✓  80-89 (Solid):    {solid}")
-    print(f"  📉 <80:              {below_80}")
-    print(f"\n  Average: {summary['score']['avg']} | Range: {summary['score']['min']} - {summary['score']['max']}")
-    
-    print(f"\n🎯 Priority Breakdown:")
-    print(f"  🔥 High:   {summary['priority']['high']} ({summary['priority']['high_pct']}%)")
-    print(f"  🟡 Medium: {summary['priority']['medium']} ({summary['priority']['medium_pct']}%)")
-    print(f"  ⚪ Low:    {summary['priority']['low']} ({summary['priority']['low_pct']}%)")
-    
-    print(f"\n📈 Confidence:")
+    print(f"\nConfidence:")
     print(f"  Average: {summary['confidence']['avg']}")
     print(f"  Range: {summary['confidence']['min']} - {summary['confidence']['max']}")
     
-    # Elite check
-    print(f"\n✅ Elite (100) leads: {elite_100} out of {len(scored_leads)}")
-    if elite_100 == 0:
-        print("   (100 is reserved for elite leads meeting ALL criteria)")
+    print(f"\nOpportunity Distribution:")
+    print(f"  Avg per lead: {summary['opportunities']['avg_per_lead']}")
+    for opp_type, count in summary['opportunities']['by_type'].items():
+        pct = round(count / len(scored_leads) * 100, 1)
+        print(f"  {opp_type}: {count} ({pct}%)")
+    
+    print(f"\nInternal Score (for sorting only):")
+    print(f"  Average: {summary['score']['avg']}")
+    print(f"  Range: {summary['score']['min']} - {summary['score']['max']}")
     
     print("\n" + "=" * 70)
-    print("✓ Test complete - no API calls made")
+    print("Done - no API calls made")
     print("=" * 70)
 
 

@@ -33,7 +33,9 @@ from pipeline.fetch import PlacesFetcher
 from pipeline.normalize import normalize_place, deduplicate_places
 from pipeline.enrich import PlaceDetailsEnricher
 from pipeline.signals import extract_signals, merge_signals_into_lead
+from pipeline.meta_ads import get_meta_access_token, augment_lead_with_meta_ads
 from pipeline.score import score_lead, get_scoring_summary
+from pipeline.context import build_context
 
 # Configure logging
 logging.basicConfig(
@@ -147,9 +149,13 @@ def run_small_test():
     logger.info("\n[Step 4] Extracting signals...")
     
     final_leads = []
+    if get_meta_access_token():
+        logger.info("  (META_ACCESS_TOKEN set — will augment with Meta Ads Library)")
     for lead in enriched_leads:
         signals = extract_signals(lead)
         merged = merge_signals_into_lead(lead, signals)
+        if get_meta_access_token():
+            augment_lead_with_meta_ads(merged)
         final_leads.append(merged)
         
         logger.info(f"  ✓ {lead['name'][:40]}")
@@ -157,11 +163,19 @@ def run_small_test():
         logger.info(f"    📝 Contact Form: {signals.get('has_contact_form')} | Email: {signals.get('has_email')}")
         logger.info(f"    ⚙️ Auto-scheduling: {signals.get('has_automated_scheduling')} | Trust: {signals.get('has_trust_badges')}")
         logger.info(f"    ⭐ Rating: {signals.get('rating')} | Reviews: {signals.get('review_count')}")
+        if get_meta_access_token():
+            meta_info = merged.get("signal_meta_ads_count")
+            if meta_info is not None:
+                logger.info(f"    📢 Meta Ads: %s ad(s) in library", meta_info)
+            elif merged.get("signal_meta_ads_source"):
+                logger.info(f"    📢 Meta Ads: checked (meta_ads_library)")
+            else:
+                logger.info(f"    📢 Meta Ads: checked — none in library for US")
     
     # =========================================
-    # Step 5: Score leads
+    # Step 5: Opportunity Intelligence + Scoring + Context (deterministic)
     # =========================================
-    logger.info("\n[Step 5] Scoring leads...")
+    logger.info("\n[Step 5] Analyzing opportunities and building context...")
     
     scored_leads = []
     for lead in final_leads:
@@ -170,13 +184,29 @@ def run_small_test():
         lead["priority"] = result.priority
         lead["confidence"] = result.confidence
         lead["reasons"] = result.reasons
+        lead["opportunities"] = result.opportunities
+        lead["review_summary"] = result.review_summary
+        # Context-first dimensions (deterministic)
+        ctx = build_context(lead)
+        lead["context_dimensions"] = ctx["context_dimensions"]
+        lead["reasoning_summary"] = ctx["reasoning_summary"]
+        lead["priority_suggestion"] = ctx.get("priority_suggestion")
+        lead["primary_themes"] = ctx.get("primary_themes", [])
+        lead["suggested_outreach_angles"] = ctx.get("suggested_outreach_angles", [])
         scored_leads.append(lead)
         
         logger.info(f"  ✓ {lead['name'][:40]}")
-        logger.info(f"    Score: {result.lead_score} | Priority: {result.priority} | Confidence: {result.confidence}")
+        logger.info(f"    Priority: {result.priority} | Score: {result.lead_score} | Confidence: {result.confidence}")
+        
+        if result.opportunities:
+            for opp in result.opportunities:
+                logger.info(f"    [{opp['strength']}] {opp['type']}")
+        else:
+            logger.info(f"    No strong opportunities detected")
+        logger.info(f"    Context: {ctx.get('priority_suggestion')} | themes: {ctx.get('primary_themes', [])[:2]}")
+        
         rs = result.review_summary
         logger.info(f"    Reviews: {rs['review_count']} ({rs['volume']}) | Last: {rs['last_review_text']} ({rs['freshness']})")
-        logger.info(f"    Reasons: {', '.join(result.reasons[:2])}...")
     
     final_leads = scored_leads
     
@@ -221,12 +251,16 @@ def run_small_test():
     logger.info(f"Leads processed: {len(final_leads)}")
     logger.info(f"Output file: {TEST_CONFIG['output_file']}")
     
-    # Print scoring summary
+    # Print opportunity summary
     if final_leads:
         summary = get_scoring_summary(final_leads)
-        logger.info(f"\nScoring Summary:")
-        logger.info(f"  Avg Score: {summary['score']['avg']}")
-        logger.info(f"  🔥 High: {summary['priority']['high']} | 🟡 Medium: {summary['priority']['medium']} | ⚪ Low: {summary['priority']['low']}")
+        logger.info(f"\nOpportunity Summary:")
+        logger.info(f"  Avg opportunities per lead: {summary['opportunities']['avg_per_lead']}")
+        logger.info(f"  Priority: High: {summary['priority']['high']} | Medium: {summary['priority']['medium']} | Low: {summary['priority']['low']}")
+        if summary['opportunities']['by_type']:
+            logger.info(f"  Types found:")
+            for opp_type, count in summary['opportunities']['by_type'].items():
+                logger.info(f"    {opp_type}: {count}")
     
     # Print one full example
     if final_leads:
@@ -234,7 +268,11 @@ def run_small_test():
         logger.info("SAMPLE OUTPUT (first lead):")
         logger.info("-" * 60)
         sample = {k: v for k, v in final_leads[0].items() 
-                  if k.startswith('signal_') or k in ['place_id', 'name', 'address', 'lead_score', 'priority', 'confidence', 'reasons']}
+                  if k.startswith('signal_') or k in [
+                      'place_id', 'name', 'address',
+                      'opportunities', 'priority', 'confidence',
+                      'lead_score', 'review_summary',
+                  ]}
         print(json.dumps(sample, indent=2, default=str))
     
     return final_leads

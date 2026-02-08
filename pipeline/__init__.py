@@ -1,15 +1,21 @@
 """
-Lead Scoring Engine - Pipeline Package
+Opportunity Intelligence Engine - Pipeline Package
 
 This package provides a complete pipeline for extracting, normalizing,
-enriching, and exporting business leads from Google Places API.
+enriching, and analyzing business leads from Google Places API.
 
-Modules:
+Architecture:
     geo: Geographic grid generation for comprehensive coverage
     fetch: Google Places Nearby Search API client with rate limiting
     normalize: Data normalization and deduplication
     enrich: Google Places Details API for additional data
-    signals: Website and business signal extraction
+    signals: Business signal extraction (website, ads, hiring, reviews)
+    meta_ads: Meta Ads Library API (optional, META_ACCESS_TOKEN)
+    context: Context-first deterministic interpreter (dimensions, reasoning)
+    llm_reasoning: Optional LLM refinement (--llm_reasoning)
+    db: SQLite persistence (runs, leads, signals, context_dimensions)
+    opportunities: Opportunity intelligence builder (CORE, legacy)
+    score: Prioritization helper (backward-compatible scoring)
     export: Export to JSON, CSV, and database formats
 """
 
@@ -30,6 +36,15 @@ from .signals import (
     normalize_domain,
     normalize_phone,
     analyze_website
+)
+from .meta_ads import get_meta_access_token, check_meta_ads, augment_lead_with_meta_ads
+from .context import build_context, calculate_confidence
+from .opportunities import (
+    analyze_opportunities,
+    analyze_opportunities_batch,
+    get_opportunity_summary,
+    Opportunity,
+    OpportunityReport,
 )
 from .export import export_to_json, export_to_csv, to_db_records
 from .score import score_lead, score_leads_batch, get_scoring_summary, ScoringResult
@@ -56,13 +71,26 @@ __all__ = [
     "normalize_domain",
     "normalize_phone",
     "analyze_website",
-    # export
-    "export_to_json",
-    "export_to_csv",
-    "to_db_records",
-    # score
+    # meta_ads
+    "get_meta_access_token",
+    "check_meta_ads",
+    "augment_lead_with_meta_ads",
+    # context (context-first interpreter)
+    "build_context",
+    "calculate_confidence",
+    # opportunities (CORE)
+    "analyze_opportunities",
+    "analyze_opportunities_batch",
+    "get_opportunity_summary",
+    "Opportunity",
+    "OpportunityReport",
+    # score (backward-compatible prioritization)
     "score_lead",
     "score_leads_batch",
     "get_scoring_summary",
     "ScoringResult",
+    # export
+    "export_to_json",
+    "export_to_csv",
+    "to_db_records",
 ]

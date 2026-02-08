@@ -13,6 +13,8 @@ Usage:
 
 Environment Variables:
     GOOGLE_PLACES_API_KEY: Required. Your Google Places API key.
+    META_ACCESS_TOKEN: Optional. If set, augments leads with Meta Ads Library
+        (confirms runs_paid_ads / paid_ads_channels from API when ads found).
 
 Input:
     Reads from output/leads_*.json (most recent file)
@@ -26,8 +28,9 @@ import sys
 import json
 import glob
 import logging
+import argparse
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +41,22 @@ from pipeline.signals import (
     extract_signals_batch,
     merge_signals_into_lead
 )
+from pipeline.meta_ads import get_meta_access_token, augment_lead_with_meta_ads
+from pipeline.context import build_context
+from pipeline.llm_reasoning import refine_with_llm
+from pipeline.db import (
+    init_db,
+    create_run,
+    insert_lead,
+    insert_lead_signals,
+    insert_context_dimensions,
+    insert_lead_embedding,
+    get_similar_lead_ids,
+    update_run_completed,
+    update_run_failed,
+)
+from pipeline.embeddings import get_embedding, text_to_embed
+from pipeline.validation import check_lead_signals, check_context
 
 # Configure logging
 logging.basicConfig(
@@ -62,6 +81,7 @@ CONFIG = {
     "output_dir": "output",
     "max_leads": None,  # None = process all, or set a number for testing
     "progress_interval": 10,
+    "llm_reasoning": False,  # Set True with --llm_reasoning to refine reasoning/themes via LLM
 }
 
 
@@ -80,6 +100,30 @@ def find_latest_leads_file(input_dir: str) -> str:
     # Sort by modification time, newest first
     files.sort(key=os.path.getmtime, reverse=True)
     return files[0]
+
+
+def _compute_run_stats(signals: List[Dict]) -> Dict:
+    """Health/coverage metrics for a run (stored in runs.run_stats)."""
+    total = len(signals)
+    if total == 0:
+        return {"total": 0}
+    keys = ("has_website", "website_accessible", "has_contact_form", "has_phone", "has_email", "has_automated_scheduling")
+    counts = {f"{k}_true": sum(1 for s in signals if s.get(k) is True) for k in keys}
+    counts.update({f"{k}_false": sum(1 for s in signals if s.get(k) is False) for k in keys})
+    counts.update({f"{k}_unknown": sum(1 for s in signals if s.get(k) is None) for k in keys})
+    known = sum(1 for s in signals if any(s.get(k) is not None for k in keys))
+    counts["total"] = total
+    counts["signal_coverage_pct"] = round(100 * known / total, 1) if total else 0
+    return counts
+
+
+def load_place_ids(filepath: str) -> List[str]:
+    """Load place_ids from file: one per line or JSON array."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+    if raw.startswith("["):
+        return json.loads(raw)
+    return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
 def load_leads(filepath: str) -> List[Dict]:
@@ -105,10 +149,16 @@ def save_enriched_leads(
     """Save enriched leads with signals to JSON."""
     os.makedirs(output_dir, exist_ok=True)
     
-    # Merge signals into leads
+    use_meta_ads = get_meta_access_token() is not None
+    if use_meta_ads:
+        logger.info("META_ACCESS_TOKEN set — augmenting leads with Meta Ads Library")
+    
+    # Merge signals into leads, optionally augment with Meta Ads Library
     enriched_leads = []
     for lead, signal in zip(leads, signals):
         merged = merge_signals_into_lead(lead, signal)
+        if use_meta_ads:
+            augment_lead_with_meta_ads(merged)
         enriched_leads.append(merged)
     
     # Generate output filename
@@ -267,7 +317,8 @@ def generate_signal_summary(signals: List[Dict]) -> Dict:
 
 def run_enrichment_pipeline(
     input_file: str = None,
-    max_leads: int = None
+    max_leads: int = None,
+    place_ids_file: str = None,
 ) -> List[Dict]:
     """
     Run the complete enrichment and signal extraction pipeline.
@@ -295,7 +346,17 @@ def run_enrichment_pipeline(
     if max_leads:
         leads = leads[:max_leads]
         logger.info(f"Limited to {max_leads} leads for processing")
-    
+
+    # Optional: only enrich leads whose place_id is in the given file (re-enrichment)
+    if place_ids_file:
+        place_ids = set(load_place_ids(place_ids_file))
+        before = len(leads)
+        leads = [l for l in leads if l.get("place_id") in place_ids]
+        logger.info(f"Filtered to {len(leads)} leads (place_ids file: {place_ids_file}, had {before})")
+        if not leads:
+            logger.warning("No leads left after place_ids filter; exiting")
+            return []
+
     # Step 2: Enrich with Place Details
     logger.info("\nStep 1: Fetching Place Details (website, phone, reviews)...")
     try:
@@ -320,6 +381,70 @@ def run_enrichment_pipeline(
         enriched_leads,
         progress_interval=CONFIG["progress_interval"]
     )
+    
+    # Step 3b: Context-first pipeline (DB + optional LLM)
+    use_llm = CONFIG.get("llm_reasoning", False)
+    if use_llm:
+        logger.info("LLM reasoning enabled (--llm_reasoning)")
+    run_id = create_run({
+        "max_leads": CONFIG.get("max_leads"),
+        "llm_reasoning": use_llm,
+        "source": "run_enrichment",
+    })
+    use_meta_ads = get_meta_access_token() is not None
+    try:
+        for idx, (lead, signal) in enumerate(zip(enriched_leads, signals)):
+            merged = merge_signals_into_lead(lead, signal)
+            if use_meta_ads:
+                augment_lead_with_meta_ads(merged)
+            context = build_context(merged)
+            # RAG (Phase 2): embed current context, retrieve similar past summaries for LLM
+            similar_summaries = []
+            text_for_rag = text_to_embed(context)
+            if text_for_rag:
+                emb = get_embedding(text_for_rag)
+                if emb:
+                    similar = get_similar_lead_ids(emb, limit=5, exclude_run_id=run_id)
+                    similar_summaries = [s[2] for s in similar if s[2]]
+            if use_llm:
+                context = refine_with_llm(
+                    context,
+                    lead.get("name"),
+                    similar_summaries=similar_summaries if similar_summaries else None,
+                )
+            validation_warnings = check_lead_signals(signal) + check_context(context)
+            if validation_warnings:
+                context["validation_warnings"] = validation_warnings
+            lead_id = insert_lead(run_id, merged)
+            insert_lead_signals(lead_id, signal)
+            insert_context_dimensions(
+                lead_id,
+                dimensions=context["context_dimensions"],
+                reasoning_summary=context["reasoning_summary"],
+                overall_confidence=context["confidence"],
+                priority_suggestion=context.get("priority_suggestion"),
+                primary_themes=context.get("primary_themes"),
+                outreach_angles=context.get("suggested_outreach_angles"),
+                reasoning_source=context.get("reasoning_source", "deterministic"),
+                no_opportunity=context.get("no_opportunity", False),
+                no_opportunity_reason=context.get("no_opportunity_reason"),
+                priority_derivation=context.get("priority_derivation"),
+                validation_warnings=context.get("validation_warnings"),
+            )
+            # Store embedding for future RAG (Phase 2)
+            final_text = text_to_embed(context)
+            if final_text:
+                final_emb = get_embedding(final_text)
+                if final_emb:
+                    insert_lead_embedding(lead_id, final_emb, final_text)
+            if (idx + 1) % CONFIG["progress_interval"] == 0:
+                logger.info(f"  Context + DB: {idx + 1}/{len(enriched_leads)} leads")
+        run_stats = _compute_run_stats(signals)
+        update_run_completed(run_id, len(enriched_leads), run_stats=run_stats)
+        logger.info(f"Run {run_id[:8]}... completed; {len(enriched_leads)} leads persisted to DB")
+    except Exception:
+        update_run_failed(run_id)
+        raise
     
     # Step 4: Generate summary
     summary = generate_signal_summary(signals)
@@ -386,6 +511,16 @@ def run_enrichment_pipeline(
 
 def main():
     """Main entry point."""
+    parser = argparse.ArgumentParser(description="Lead enrichment and signal extraction with context-first DB")
+    parser.add_argument("--max-leads", type=int, default=None, help="Max leads to process (default: all)")
+    parser.add_argument("--llm-reasoning", action="store_true", help="Refine reasoning/themes with LLM (requires OPENAI_API_KEY)")
+    parser.add_argument("--input", "-i", help="Input leads JSON (default: latest output/leads_*.json)")
+    parser.add_argument("--place-ids", help="Path to file with place_ids (one per line or JSON array); only enrich these leads")
+    args = parser.parse_args()
+    
+    CONFIG["max_leads"] = args.max_leads
+    CONFIG["llm_reasoning"] = args.llm_reasoning
+    
     logger.info(f"Started at: {datetime.now().isoformat()}")
     
     # Check API key
@@ -398,7 +533,9 @@ def main():
     
     # Run pipeline
     signals = run_enrichment_pipeline(
-        max_leads=CONFIG["max_leads"]
+        input_file=args.input,
+        max_leads=CONFIG["max_leads"],
+        place_ids_file=args.place_ids,
     )
     
     logger.info(f"\nCompleted at: {datetime.now().isoformat()}")
