@@ -11,9 +11,10 @@ Architecture:
     enrich: Google Places Details API for additional data
     signals: Business signal extraction (website, ads, hiring, reviews)
     meta_ads: Meta Ads Library API (optional, META_ACCESS_TOKEN)
-    context: Context-first deterministic interpreter (dimensions, reasoning)
-    llm_reasoning: Optional LLM refinement (--llm_reasoning)
-    db: SQLite persistence (runs, leads, signals, context_dimensions)
+    semantic_signals: Deterministic mapping from raw signals to six axes (for Decision Agent)
+    decision_agent: Decision Agent (single owner of judgment; verdict, reasoning, risks)
+    context: Context-first deterministic interpreter (dimensions, reasoning); legacy
+    db: SQLite persistence (runs, leads, signals, context_dimensions, decisions)
     opportunities: Opportunity intelligence builder (CORE, legacy)
     score: Prioritization helper (backward-compatible scoring)
     export: Export to JSON, CSV, and database formats
@@ -38,6 +39,8 @@ from .signals import (
     analyze_website
 )
 from .meta_ads import get_meta_access_token, check_meta_ads, augment_lead_with_meta_ads
+from .semantic_signals import build_semantic_signals
+from .decision_agent import Decision, DecisionAgent
 from .context import build_context, calculate_confidence
 from .opportunities import (
     analyze_opportunities,
@@ -48,6 +51,8 @@ from .opportunities import (
 )
 from .export import export_to_json, export_to_csv, to_db_records
 from .score import score_lead, score_leads_batch, get_scoring_summary, ScoringResult
+from .dentist_profile import is_dental_practice, build_dentist_profile_v1, fetch_website_html_for_trust
+from .dentist_llm_reasoning import dentist_llm_reasoning_layer
 
 __all__ = [
     # geo
@@ -75,7 +80,12 @@ __all__ = [
     "get_meta_access_token",
     "check_meta_ads",
     "augment_lead_with_meta_ads",
-    # context (context-first interpreter)
+    # semantic_signals (deterministic, for Decision Agent)
+    "build_semantic_signals",
+    # decision_agent (single owner of judgment; v1: no embeddings/RAG)
+    "Decision",
+    "DecisionAgent",
+    # context (deterministic evidence summarizer; legacy)
     "build_context",
     "calculate_confidence",
     # opportunities (CORE)
@@ -93,4 +103,9 @@ __all__ = [
     "export_to_json",
     "export_to_csv",
     "to_db_records",
+    # dentist vertical (dentist_profile_v1 + LLM reasoning layer)
+    "is_dental_practice",
+    "build_dentist_profile_v1",
+    "fetch_website_html_for_trust",
+    "dentist_llm_reasoning_layer",
 ]

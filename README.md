@@ -2,16 +2,18 @@
 
 A Python-based Google Places lead extraction and enrichment system that reliably collects and analyzes hundreds to thousands of business leads for a given niche and city.
 
+**Product focus:** We decide which businesses are worth your time — and tell you why. Score is internal (used for ordering/filtering); what we give users is **context**: reasoning, dimensions, themes, outreach angles, and evidence so they can act with confidence.
+
 ## Pipeline Overview
 
 | Step | Script | Description |
 |------|--------|-------------|
 | 1–3 | `run_pipeline.py` | Extract leads via Nearby Search (grid + keyword expansion) |
-| 4 | `run_enrichment.py` | Enrich with Place Details, signals, Meta Ads (optional), scoring & context; writes to SQLite |
+| 4 | `run_enrichment.py` | Enrich with Place Details, signals, Meta Ads (optional), context (reasoning, dimensions, themes); writes to SQLite |
 | 5 | `export_leads.py` | Export context-first (from DB) or legacy (from file) |
 | — | `list_runs.py` | List runs, prune by retention |
 | — | `test_small.py` | Quick end-to-end test (3 leads, ~$0.06; optional Meta Ads when token set) |
-| — | `run_upload.py` | Enrich **uploaded** leads (CSV/JSON): same signals, Meta Ads, scoring, DB; teams can run their existing lists through the pipeline |
+| — | `run_upload.py` | Enrich **uploaded** leads (CSV/JSON): same signals, Meta Ads, context, DB; teams can run their existing lists through the pipeline |
 
 ## Features
 
@@ -21,13 +23,13 @@ A Python-based Google Places lead extraction and enrichment system that reliably
 - **Pagination**: Up to 60 results per query
 - **Deduplication**: Removes duplicates using `place_id`
 
-### Signal Extraction & Scoring (Step 4)
+### Signal Extraction & Context (Step 4)
 - **Place Details Enrichment**: Website, phone, reviews
 - **Website Signals**: SSL, mobile-friendly, contact forms, booking widgets, LinkedIn company URL
 - **Phone Normalization**: International format standardization
 - **Review Analysis**: Recency, count, rating; optional review summary and themes (LLM or keyword fallback)
 - **Meta Ads Library** (optional): When `META_ACCESS_TOKEN` is set, checks whether the business runs Meta ads; augments `signal_runs_paid_ads` / `signal_paid_ads_channels`
-- **Scoring & Context**: Six dimensions, priority, confidence, opportunities; optional LLM refinement and RAG (`--llm-reasoning`)
+- **Context for the user**: Six dimensions, reasoning summary, priority suggestion, themes, suggested outreach angles, confidence, and optional LLM refinement and RAG (`--llm-reasoning`). Score is internal; export and UX should emphasize this context so users see *why* a lead is or isn’t worth their time.
 
 ### Cost Optimization
 - **Field Selection**: Only request needed Place Details fields (53% savings)
@@ -86,7 +88,7 @@ python scripts/run_enrichment.py
 # Optional: --llm-reasoning (needs OPENAI_API_KEY), --max-leads N, --input path/to/leads.json
 ```
 
-Enrichment includes Place Details, website signals, review context, optional Meta Ads check, scoring, and context (6 dimensions). Results are stored in SQLite; optional enriched JSON in `output/`.
+Enrichment includes Place Details, website signals, review context, optional Meta Ads check, and rich context (6 dimensions, reasoning, themes, outreach angles). Results are stored in SQLite; optional enriched JSON in `output/`.
 
 ### 5. Export leads (default: context-first from DB)
 
@@ -98,7 +100,7 @@ python scripts/export_leads.py
 
 ### 6. (Optional) Upload existing leads
 
-Teams can run the same enrichment (signals, Meta Ads, scoring, context) on their own lists:
+Teams can run the same enrichment (signals, Meta Ads, context) on their own lists:
 
 ```bash
 python scripts/run_upload.py --upload path/to/leads.csv

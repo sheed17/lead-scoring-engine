@@ -310,7 +310,29 @@ NICHE_KEYWORDS = {
         "janitorial service",
         "commercial cleaning",
         "maid service"
-    ]
+    ],
+    "dentist": [
+        "dentist",
+        "dental clinic",
+        "dental office",
+        "cosmetic dentist",
+        "orthodontist",
+        "family dentist",
+        "general dentist",
+        "teeth cleaning",
+        "dental implants"
+    ],
+    "dental": [
+        "dentist",
+        "dental clinic",
+        "dental office",
+        "cosmetic dentist",
+        "orthodontist",
+        "family dentist",
+        "general dentist",
+        "teeth cleaning",
+        "dental implants"
+    ],
 }
 
 

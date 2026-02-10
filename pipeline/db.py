@@ -92,8 +92,24 @@ def init_db() -> None:
                 FOREIGN KEY (lead_id) REFERENCES leads(id)
             );
 
+            CREATE TABLE IF NOT EXISTS decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL UNIQUE,
+                agency_type TEXT NOT NULL,
+                signals_snapshot TEXT,
+                verdict TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                reasoning TEXT NOT NULL,
+                primary_risks TEXT,
+                what_would_change TEXT,
+                prompt_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (lead_id) REFERENCES leads(id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_leads_run ON leads(run_id);
             CREATE INDEX IF NOT EXISTS idx_context_lead ON context_dimensions(lead_id);
+            CREATE INDEX IF NOT EXISTS idx_decisions_lead ON decisions(lead_id);
         """)
         conn.commit()
         # Optional columns (migration for existing DBs)
@@ -103,6 +119,8 @@ def init_db() -> None:
             "ALTER TABLE context_dimensions ADD COLUMN no_opportunity_reason TEXT",
             "ALTER TABLE context_dimensions ADD COLUMN priority_derivation TEXT",
             "ALTER TABLE context_dimensions ADD COLUMN validation_warnings TEXT",
+            "ALTER TABLE leads ADD COLUMN dentist_profile_v1_json TEXT",
+            "ALTER TABLE leads ADD COLUMN llm_reasoning_layer_json TEXT",
         ]:
             try:
                 conn.execute(sql)
@@ -166,6 +184,46 @@ def insert_lead_signals(lead_id: int, signals: Dict) -> None:
         conn.execute(
             "INSERT INTO lead_signals (lead_id, signals_json, created_at) VALUES (?, ?, ?)",
             (lead_id, json.dumps(signals, default=str), now)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_decision(
+    lead_id: int,
+    agency_type: str,
+    signals_snapshot: Optional[Dict],
+    verdict: str,
+    confidence: float,
+    reasoning: str,
+    primary_risks: List[str],
+    what_would_change: List[str],
+    prompt_version: str,
+) -> None:
+    """Store one decision (Decision Agent output) for a lead. Verbatim for future learning."""
+    now = datetime.now(timezone.utc).isoformat()
+    signals_json = json.dumps(signals_snapshot, default=str) if signals_snapshot else None
+    risks_json = json.dumps(primary_risks) if primary_risks else None
+    change_json = json.dumps(what_would_change) if what_would_change else None
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO decisions (lead_id, agency_type, signals_snapshot, verdict, confidence,
+               reasoning, primary_risks, what_would_change, prompt_version, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                lead_id,
+                agency_type,
+                signals_json,
+                verdict,
+                confidence,
+                reasoning,
+                risks_json,
+                change_json,
+                prompt_version,
+                now,
+            ),
         )
         conn.commit()
     finally:
@@ -237,6 +295,32 @@ def insert_context_dimensions(
             )
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def update_lead_dentist_data(
+    lead_id: int,
+    dentist_profile_v1: Optional[Dict] = None,
+    llm_reasoning_layer: Optional[Dict] = None,
+) -> None:
+    """Store dentist vertical profile and/or LLM reasoning layer for a lead."""
+    conn = _get_conn()
+    try:
+        if dentist_profile_v1 is not None:
+            conn.execute(
+                "UPDATE leads SET dentist_profile_v1_json = ? WHERE id = ?",
+                (json.dumps(dentist_profile_v1, default=str), lead_id),
+            )
+        if llm_reasoning_layer is not None:
+            conn.execute(
+                "UPDATE leads SET llm_reasoning_layer_json = ? WHERE id = ?",
+                (json.dumps(llm_reasoning_layer, default=str), lead_id),
+            )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Columns may not exist on old DBs
+        pass
     finally:
         conn.close()
 
@@ -425,6 +509,7 @@ def delete_run(run_id: str) -> int:
             conn.commit()
             return 0
         placeholders = ",".join("?" * len(lead_ids))
+        conn.execute(f"DELETE FROM decisions WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM lead_embeddings WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM context_dimensions WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM lead_signals WHERE lead_id IN ({placeholders})", lead_ids)
@@ -530,3 +615,82 @@ def get_leads_with_context_by_run(run_id: str) -> List[Dict]:
         return out
     finally:
         conn.close()
+
+
+def get_leads_with_decisions_by_run(run_id: str) -> List[Dict]:
+    """
+    Return all leads for a run with signals and decision joined.
+    Each item: lead fields + raw_signals + verdict, confidence, reasoning, primary_risks, what_would_change, agency_type, prompt_version.
+    """
+    conn = _get_conn()
+    try:
+        try:
+            rows = conn.execute(
+                """SELECT l.id AS lead_id, l.run_id, l.place_id, l.name, l.address, l.latitude, l.longitude,
+                          ls.signals_json,
+                          d.agency_type, d.verdict, d.confidence, d.reasoning, d.primary_risks, d.what_would_change, d.prompt_version,
+                          l.dentist_profile_v1_json, l.llm_reasoning_layer_json
+                   FROM leads l
+                   LEFT JOIN lead_signals ls ON ls.lead_id = l.id
+                   LEFT JOIN decisions d ON d.lead_id = l.id
+                   WHERE l.run_id = ?
+                   ORDER BY l.id""",
+                (run_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                """SELECT l.id AS lead_id, l.run_id, l.place_id, l.name, l.address, l.latitude, l.longitude,
+                          ls.signals_json,
+                          d.agency_type, d.verdict, d.confidence, d.reasoning, d.primary_risks, d.what_would_change, d.prompt_version
+                   FROM leads l
+                   LEFT JOIN lead_signals ls ON ls.lead_id = l.id
+                   LEFT JOIN decisions d ON d.lead_id = l.id
+                   WHERE l.run_id = ?
+                   ORDER BY l.id""",
+                (run_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            lead = {
+                "lead_id": row["lead_id"],
+                "run_id": row["run_id"],
+                "place_id": row["place_id"],
+                "name": row["name"],
+                "address": row["address"],
+                "latitude": row["latitude"],
+                "longitude": row["longitude"],
+                "raw_signals": json.loads(row["signals_json"]) if row["signals_json"] else {},
+                "verdict": row["verdict"] if row.get("verdict") else None,
+                "confidence": row["confidence"] if row.get("confidence") is not None else None,
+                "reasoning": row["reasoning"] or "",
+                "primary_risks": json.loads(row["primary_risks"]) if row.get("primary_risks") else [],
+                "what_would_change": json.loads(row["what_would_change"]) if row.get("what_would_change") else [],
+                "agency_type": row["agency_type"] if row.get("agency_type") else None,
+                "prompt_version": row["prompt_version"] if row.get("prompt_version") else None,
+            }
+            try:
+                if row["dentist_profile_v1_json"] is not None:
+                    lead["dentist_profile_v1"] = json.loads(row["dentist_profile_v1_json"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                pass
+            try:
+                if row["llm_reasoning_layer_json"] is not None:
+                    lead["llm_reasoning_layer"] = json.loads(row["llm_reasoning_layer_json"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                pass
+            out.append(lead)
+        return out
+    finally:
+        conn.close()
+
+
+def get_leads_with_decisions_deduped_by_place_id(limit_runs: int = 10) -> List[Dict]:
+    """Get leads from latest completed runs with decisions, one per place_id (most recent run wins)."""
+    runs = list_runs(limit=limit_runs, status="completed")
+    by_place = {}
+    for r in runs:
+        for lead in get_leads_with_decisions_by_run(r["id"]):
+            pid = lead.get("place_id")
+            if pid and pid not in by_place:
+                by_place[pid] = lead
+    return list(by_place.values())

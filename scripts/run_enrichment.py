@@ -42,21 +42,26 @@ from pipeline.signals import (
     merge_signals_into_lead
 )
 from pipeline.meta_ads import get_meta_access_token, augment_lead_with_meta_ads
-from pipeline.context import build_context
-from pipeline.llm_reasoning import refine_with_llm
+from pipeline.semantic_signals import build_semantic_signals
+from pipeline.decision_agent import DecisionAgent
 from pipeline.db import (
     init_db,
     create_run,
     insert_lead,
     insert_lead_signals,
-    insert_context_dimensions,
-    insert_lead_embedding,
-    get_similar_lead_ids,
+    insert_decision,
+    update_lead_dentist_data,
     update_run_completed,
     update_run_failed,
 )
-from pipeline.embeddings import get_embedding, text_to_embed
-from pipeline.validation import check_lead_signals, check_context
+from pipeline.validation import check_lead_signals
+from pipeline.context import build_context
+from pipeline.dentist_profile import (
+    is_dental_practice,
+    build_dentist_profile_v1,
+    fetch_website_html_for_trust,
+)
+from pipeline.dentist_llm_reasoning import dentist_llm_reasoning_layer
 
 # Configure logging
 logging.basicConfig(
@@ -81,7 +86,7 @@ CONFIG = {
     "output_dir": "output",
     "max_leads": None,  # None = process all, or set a number for testing
     "progress_interval": 10,
-    "llm_reasoning": False,  # Set True with --llm_reasoning to refine reasoning/themes via LLM
+    "agency_type": os.getenv("AGENCY_TYPE", "marketing").lower() or "marketing",  # "seo" | "marketing"
 }
 
 
@@ -382,63 +387,62 @@ def run_enrichment_pipeline(
         progress_interval=CONFIG["progress_interval"]
     )
     
-    # Step 3b: Context-first pipeline (DB + optional LLM)
-    use_llm = CONFIG.get("llm_reasoning", False)
-    if use_llm:
-        logger.info("LLM reasoning enabled (--llm_reasoning)")
+    # Step 3b: Decision Agent (single owner of judgment); no embeddings/RAG in v1
+    agency_type = CONFIG.get("agency_type", "marketing")
+    if agency_type not in ("seo", "marketing"):
+        agency_type = "marketing"
+    logger.info("Decision Agent: agency_type=%s", agency_type)
     run_id = create_run({
         "max_leads": CONFIG.get("max_leads"),
-        "llm_reasoning": use_llm,
+        "agency_type": agency_type,
         "source": "run_enrichment",
     })
     use_meta_ads = get_meta_access_token() is not None
+    agent = DecisionAgent(agency_type=agency_type)
     try:
         for idx, (lead, signal) in enumerate(zip(enriched_leads, signals)):
             merged = merge_signals_into_lead(lead, signal)
             if use_meta_ads:
                 augment_lead_with_meta_ads(merged)
-            context = build_context(merged)
-            # RAG (Phase 2): embed current context, retrieve similar past summaries for LLM
-            similar_summaries = []
-            text_for_rag = text_to_embed(context)
-            if text_for_rag:
-                emb = get_embedding(text_for_rag)
-                if emb:
-                    similar = get_similar_lead_ids(emb, limit=5, exclude_run_id=run_id)
-                    similar_summaries = [s[2] for s in similar if s[2]]
-            if use_llm:
-                context = refine_with_llm(
-                    context,
-                    lead.get("name"),
-                    similar_summaries=similar_summaries if similar_summaries else None,
-                )
-            validation_warnings = check_lead_signals(signal) + check_context(context)
-            if validation_warnings:
-                context["validation_warnings"] = validation_warnings
             lead_id = insert_lead(run_id, merged)
             insert_lead_signals(lead_id, signal)
-            insert_context_dimensions(
-                lead_id,
-                dimensions=context["context_dimensions"],
-                reasoning_summary=context["reasoning_summary"],
-                overall_confidence=context["confidence"],
-                priority_suggestion=context.get("priority_suggestion"),
-                primary_themes=context.get("primary_themes"),
-                outreach_angles=context.get("suggested_outreach_angles"),
-                reasoning_source=context.get("reasoning_source", "deterministic"),
-                no_opportunity=context.get("no_opportunity", False),
-                no_opportunity_reason=context.get("no_opportunity_reason"),
-                priority_derivation=context.get("priority_derivation"),
-                validation_warnings=context.get("validation_warnings"),
+            semantic = build_semantic_signals(merged)
+            decision = agent.decide(semantic, lead_name=lead.get("name") or "")
+            insert_decision(
+                lead_id=lead_id,
+                agency_type=agency_type,
+                signals_snapshot=semantic,
+                verdict=decision.verdict,
+                confidence=decision.confidence,
+                reasoning=decision.reasoning,
+                primary_risks=decision.primary_risks,
+                what_would_change=decision.what_would_change,
+                prompt_version=agent.prompt_version,
             )
-            # Store embedding for future RAG (Phase 2)
-            final_text = text_to_embed(context)
-            if final_text:
-                final_emb = get_embedding(final_text)
-                if final_emb:
-                    insert_lead_embedding(lead_id, final_emb, final_text)
+            # Dentist vertical: profile + LLM reasoning (read-only) for dental practices only
+            if is_dental_practice(merged):
+                url = merged.get("signal_website_url")
+                website_html = fetch_website_html_for_trust(url) if url else None
+                dentist_profile_v1 = build_dentist_profile_v1(merged, website_html=website_html)
+                llm_reasoning_layer = {}
+                if dentist_profile_v1:
+                    context = build_context(merged)
+                    lead_score = round(decision.confidence * 100) if decision.confidence is not None else None
+                    llm_reasoning_layer = dentist_llm_reasoning_layer(
+                        business_snapshot=merged,
+                        dentist_profile_v1=dentist_profile_v1,
+                        context_dimensions=context.get("context_dimensions", []),
+                        lead_score=lead_score,
+                        priority=decision.verdict,
+                        confidence=decision.confidence,
+                    )
+                update_lead_dentist_data(
+                    lead_id,
+                    dentist_profile_v1=dentist_profile_v1,
+                    llm_reasoning_layer=llm_reasoning_layer if llm_reasoning_layer else None,
+                )
             if (idx + 1) % CONFIG["progress_interval"] == 0:
-                logger.info(f"  Context + DB: {idx + 1}/{len(enriched_leads)} leads")
+                logger.info(f"  Decision + DB: {idx + 1}/{len(enriched_leads)} leads")
         run_stats = _compute_run_stats(signals)
         update_run_completed(run_id, len(enriched_leads), run_stats=run_stats)
         logger.info(f"Run {run_id[:8]}... completed; {len(enriched_leads)} leads persisted to DB")
@@ -513,13 +517,14 @@ def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description="Lead enrichment and signal extraction with context-first DB")
     parser.add_argument("--max-leads", type=int, default=None, help="Max leads to process (default: all)")
-    parser.add_argument("--llm-reasoning", action="store_true", help="Refine reasoning/themes with LLM (requires OPENAI_API_KEY)")
+    parser.add_argument("--agency-type", choices=("seo", "marketing"), default=None, help="Agency context for Decision Agent (default: AGENCY_TYPE env or 'marketing')")
     parser.add_argument("--input", "-i", help="Input leads JSON (default: latest output/leads_*.json)")
     parser.add_argument("--place-ids", help="Path to file with place_ids (one per line or JSON array); only enrich these leads")
     args = parser.parse_args()
     
     CONFIG["max_leads"] = args.max_leads
-    CONFIG["llm_reasoning"] = args.llm_reasoning
+    if args.agency_type is not None:
+        CONFIG["agency_type"] = args.agency_type
     
     logger.info(f"Started at: {datetime.now().isoformat()}")
     

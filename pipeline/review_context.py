@@ -65,7 +65,7 @@ def _llm_summarize_reviews(texts: List[str], rating: Optional[float], review_cou
 Reviews:
 {combined}
 
-Respond with JSON only: {"summary": "...", "themes": ["...", "..."]}"""
+Respond with JSON only: {{"summary": "...", "themes": ["...", "..."]}}"""
     try:
         r = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),

@@ -59,12 +59,12 @@ CITY_CONFIG = {
     "radius_km": 15.0  # Cover ~15km radius from downtown
 }
 
-# Search configuration
+# Search configuration (dentist vertical for SEO agency opportunity intelligence)
 SEARCH_CONFIG = {
-    "niche": "hvac",              # Business niche to search
+    "niche": "dentist",           # Business niche: dentist | dental | hvac | plumber | etc.
     "search_radius_km": 2.0,      # Radius for each grid search (km)
     "max_pages_per_query": 3,     # Max pagination depth (1-3)
-    "use_keyword_expansion": True # Use multiple keywords per niche
+    "use_keyword_expansion": True  # Use multiple keywords per niche
 }
 
 # Output configuration

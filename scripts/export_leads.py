@@ -2,8 +2,8 @@
 """
 Export analyzed leads to clean, shareable formats.
 
-Default: read from SQLite (latest run), export context-first shape
-(context_dimensions, reasoning_summary, themes, outreach_angles, confidence).
+Default: read from SQLite (latest run), export decision-first shape
+(verdict, reasoning, primary_risks, what_would_change, confidence, agency_type).
 
 With --export_legacy: read from latest scored/enriched JSON file, export
 legacy shape (opportunities, priority, lead_score, reasons).
@@ -26,7 +26,13 @@ from datetime import datetime
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline.db import get_latest_run_id, get_leads_with_context_by_run, get_leads_with_context_deduped_by_place_id
+from pipeline.db import (
+    get_latest_run_id,
+    get_leads_with_context_by_run,
+    get_leads_with_context_deduped_by_place_id,
+    get_leads_with_decisions_by_run,
+    get_leads_with_decisions_deduped_by_place_id,
+)
 
 
 def find_latest_file(input_dir: str = "output") -> str:
@@ -231,8 +237,33 @@ def export_to_csv(leads: list, output_path: str):
 # CONTEXT-FIRST EXPORT (default, from DB)
 # =============================================================================
 
+def _clean_lead_decision_for_export(lead: dict) -> dict:
+    """One row for decision-first export (from get_leads_with_decisions_by_run)."""
+    out = {
+        "verdict": lead.get("verdict"),
+        "confidence": lead.get("confidence"),
+        "reasoning": lead.get("reasoning", ""),
+        "primary_risks": "; ".join(lead.get("primary_risks") or []),
+        "what_would_change": "; ".join(lead.get("what_would_change") or []),
+        "agency_type": lead.get("agency_type"),
+        "prompt_version": lead.get("prompt_version"),
+        "place_id": lead.get("place_id"),
+        "name": lead.get("name"),
+        "address": lead.get("address"),
+        "raw_signals": lead.get("raw_signals", {}),
+    }
+    if lead.get("dentist_profile_v1") is not None:
+        out["dentist_profile_v1"] = lead["dentist_profile_v1"]
+    if lead.get("llm_reasoning_layer") is not None:
+        out["llm_reasoning_layer"] = lead["llm_reasoning_layer"]
+        out["llm_executive_summary"] = (lead["llm_reasoning_layer"].get("executive_summary") or "")[:500]
+    else:
+        out["llm_executive_summary"] = ""
+    return out
+
+
 def _clean_lead_context_for_export(lead: dict) -> dict:
-    """One row for context-first export (from get_leads_with_context_by_run)."""
+    """One row for context-first export (from get_leads_with_context_by_run); legacy."""
     dims_text = "; ".join(
         f"{d.get('dimension', '')}: {d.get('status', '')}"
         for d in lead.get("context_dimensions", [])
@@ -259,48 +290,64 @@ def _clean_lead_context_for_export(lead: dict) -> dict:
     return out
 
 
-def export_context_to_json(leads: list, output_path: str):
-    """Export context-first leads to JSON (full structure)."""
+def export_context_to_json(leads: list, output_path: str, decision_first: bool = True):
+    """Export leads to JSON. decision_first=True (default): verdict, reasoning, primary_risks, what_would_change."""
     clean = []
     for lead in leads:
-        clean.append({
-            "place_id": lead.get("place_id"),
-            "name": lead.get("name"),
-            "address": lead.get("address"),
-            "context_dimensions": lead.get("context_dimensions", []),
-            "reasoning_summary": lead.get("reasoning_summary", ""),
-            "priority_suggestion": lead.get("priority_suggestion"),
-            "priority_derivation": lead.get("priority_derivation"),
-            "primary_themes": lead.get("primary_themes", []),
-            "suggested_outreach_angles": lead.get("suggested_outreach_angles", []),
-            "confidence": lead.get("confidence"),
-            "reasoning_source": lead.get("reasoning_source"),
-            "no_opportunity": lead.get("no_opportunity"),
-            "no_opportunity_reason": lead.get("no_opportunity_reason"),
-            "validation_warnings": lead.get("validation_warnings", []),
-            "raw_signals": lead.get("raw_signals", {}),
-        })
+        if decision_first and lead.get("verdict") is not None:
+            row = {
+                "verdict": lead.get("verdict"),
+                "confidence": lead.get("confidence"),
+                "reasoning": lead.get("reasoning", ""),
+                "primary_risks": lead.get("primary_risks", []),
+                "what_would_change": lead.get("what_would_change", []),
+                "agency_type": lead.get("agency_type"),
+                "prompt_version": lead.get("prompt_version"),
+                "place_id": lead.get("place_id"),
+                "name": lead.get("name"),
+                "address": lead.get("address"),
+                "raw_signals": lead.get("raw_signals", {}),
+            }
+            if lead.get("dentist_profile_v1") is not None:
+                row["dentist_profile_v1"] = lead["dentist_profile_v1"]
+            if lead.get("llm_reasoning_layer") is not None:
+                row["llm_reasoning_layer"] = lead["llm_reasoning_layer"]
+            clean.append(row)
+        else:
+            clean.append({
+                "place_id": lead.get("place_id"),
+                "name": lead.get("name"),
+                "address": lead.get("address"),
+                "context_dimensions": lead.get("context_dimensions", []),
+                "reasoning_summary": lead.get("reasoning_summary", ""),
+                "priority_suggestion": lead.get("priority_suggestion"),
+                "confidence": lead.get("confidence"),
+                "raw_signals": lead.get("raw_signals", {}),
+            })
     clean.sort(key=lambda x: (x.get("confidence") or 0), reverse=True)
     data = {"exported_at": datetime.utcnow().isoformat(), "total_leads": len(clean), "leads": clean}
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    print(f"Exported {len(clean)} leads (context-first) to: {output_path}")
+    print(f"Exported {len(clean)} leads (decision-first) to: {output_path}")
     return output_path
 
 
-def export_context_to_csv(leads: list, output_path: str):
-    """Export context-first leads to CSV (flattened)."""
-    clean = [_clean_lead_context_for_export(lead) for lead in leads]
+def export_context_to_csv(leads: list, output_path: str, decision_first: bool = True):
+    """Export leads to CSV (flattened). decision_first=True: verdict, reasoning, primary_risks, what_would_change."""
+    if decision_first and leads and leads[0].get("verdict") is not None:
+        clean = [_clean_lead_decision_for_export(lead) for lead in leads]
+        fieldnames = [k for k in clean[0].keys() if k not in ("raw_signals", "dentist_profile_v1", "llm_reasoning_layer")]
+    else:
+        clean = [_clean_lead_context_for_export(lead) for lead in leads]
+        fieldnames = [k for k in clean[0].keys() if k not in ("context_dimensions", "raw_signals")]
     if not clean:
         print("No leads to export")
         return None
-    # Drop complex nested fields for CSV
-    fieldnames = [k for k in clean[0].keys() if k not in ("context_dimensions", "raw_signals")]
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(clean)
-    print(f"Exported {len(clean)} leads (context-first) to: {output_path}")
+    print(f"Exported {len(clean)} leads (decision-first) to: {output_path}")
     return output_path
 
 
@@ -352,24 +399,25 @@ def main():
         if args.format in ["csv", "both"]:
             export_to_csv(leads, f"output/{prefix}_{timestamp}.csv")
     else:
-        # Default: from DB, context-first shape
+        # Default: from DB, decision-first shape (verdict, reasoning, primary_risks, what_would_change)
         if args.dedupe_by_place_id:
             print("Loading from DB (deduped by place_id, latest run wins)...")
-            leads = get_leads_with_context_deduped_by_place_id(limit_runs=20)
-            print(f"Found {len(leads)} unique leads (context-first export)")
+            leads = get_leads_with_decisions_deduped_by_place_id(limit_runs=20)
+            print(f"Found {len(leads)} unique leads (decision-first export)")
         else:
             run_id = args.run_id or get_latest_run_id()
             if not run_id:
                 print("No completed run in DB. Run enrichment first, or use --export-legacy with a file.")
                 sys.exit(1)
             print(f"Loading from DB run: {run_id[:8]}...")
-            leads = get_leads_with_context_by_run(run_id)
-            print(f"Found {len(leads)} leads (context-first export)")
+            leads = get_leads_with_decisions_by_run(run_id)
+            print(f"Found {len(leads)} leads (decision-first export)")
         prefix = args.output or "context_export"
+        decision_first = bool(leads and leads[0].get("verdict") is not None)
         if args.format in ["json", "both"]:
-            export_context_to_json(leads, f"output/{prefix}_{timestamp}.json")
+            export_context_to_json(leads, f"output/{prefix}_{timestamp}.json", decision_first=decision_first)
         if args.format in ["csv", "both"]:
-            export_context_to_csv(leads, f"output/{prefix}_{timestamp}.csv")
+            export_context_to_csv(leads, f"output/{prefix}_{timestamp}.csv", decision_first=decision_first)
     
     print("\nExport complete!")
 

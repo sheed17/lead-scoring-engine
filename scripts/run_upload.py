@@ -3,12 +3,12 @@
 Enrich team-uploaded leads (CSV or JSON) with the same pipeline as sourced leads.
 
 Teams can upload existing leads (name, optional website, phone, address, place_id)
-and get: website signals, Meta Ads check, scoring, context, and DB persistence.
+and get: website signals, Meta Ads check, Decision Agent verdict + reasoning, and DB persistence.
 Export and list_runs work the same; runs are tagged source="upload".
 
 Usage:
     python scripts/run_upload.py --upload path/to/leads.csv
-    python scripts/run_upload.py --upload path/to/leads.json --max-leads 50 --llm-reasoning
+    python scripts/run_upload.py --upload path/to/leads.json --max-leads 50 --agency-type seo
 
 Input format:
     CSV or JSON. Required column: name.
@@ -33,21 +33,17 @@ from pipeline.upload import (
 from pipeline.enrich import PlaceDetailsEnricher
 from pipeline.signals import extract_signals_batch, merge_signals_into_lead
 from pipeline.meta_ads import get_meta_access_token, augment_lead_with_meta_ads
-from pipeline.context import build_context
-from pipeline.llm_reasoning import refine_with_llm
+from pipeline.semantic_signals import build_semantic_signals
+from pipeline.decision_agent import DecisionAgent
 from pipeline.db import (
     init_db,
     create_run,
     insert_lead,
     insert_lead_signals,
-    insert_context_dimensions,
-    insert_lead_embedding,
-    get_similar_lead_ids,
+    insert_decision,
     update_run_completed,
     update_run_failed,
 )
-from pipeline.embeddings import get_embedding, text_to_embed
-from pipeline.validation import check_lead_signals, check_context
 
 def _compute_run_stats(signals: List[Dict]) -> Dict:
     """Run stats for DB (same as run_enrichment)."""
@@ -117,7 +113,7 @@ def _enrich_uploaded_leads(leads: list, fetch_place_details: bool) -> list:
 def run_upload_pipeline(
     upload_path: str,
     max_leads: int = None,
-    llm_reasoning: bool = False,
+    agency_type: str = "marketing",
     fetch_place_details: bool = True,
     progress_interval: int = 10,
 ) -> int:
@@ -140,64 +136,42 @@ def run_upload_pipeline(
     logger.info("Step 2: Extract signals (website analysis, phone, reviews)...")
     signals = extract_signals_batch(enriched_leads, progress_interval=progress_interval)
 
-    use_llm = llm_reasoning
+    if agency_type not in ("seo", "marketing"):
+        agency_type = "marketing"
     use_meta_ads = get_meta_access_token() is not None
     if use_meta_ads:
         logger.info("META_ACCESS_TOKEN set — augmenting with Meta Ads Library")
-    if use_llm:
-        logger.info("LLM reasoning enabled (--llm-reasoning)")
+    logger.info("Decision Agent: agency_type=%s", agency_type)
 
     run_id = create_run({
         "source": "upload",
         "upload_file": upload_path,
         "max_leads": max_leads,
-        "llm_reasoning": use_llm,
+        "agency_type": agency_type,
         "fetch_place_details": fetch_place_details,
     })
+    agent = DecisionAgent(agency_type=agency_type)
 
     try:
         for idx, (lead, signal) in enumerate(zip(enriched_leads, signals)):
             merged = merge_signals_into_lead(lead, signal)
             if use_meta_ads:
                 augment_lead_with_meta_ads(merged)
-            context = build_context(merged)
-            similar_summaries = []
-            text_for_rag = text_to_embed(context)
-            if text_for_rag:
-                emb = get_embedding(text_for_rag)
-                if emb:
-                    similar = get_similar_lead_ids(emb, limit=5, exclude_run_id=run_id)
-                    similar_summaries = [s[2] for s in similar if s[2]]
-            if use_llm:
-                context = refine_with_llm(
-                    context,
-                    lead.get("name"),
-                    similar_summaries=similar_summaries or None,
-                )
-            validation_warnings = check_lead_signals(signal) + check_context(context)
-            if validation_warnings:
-                context["validation_warnings"] = validation_warnings
             lead_id = insert_lead(run_id, merged)
             insert_lead_signals(lead_id, signal)
-            insert_context_dimensions(
-                lead_id,
-                dimensions=context["context_dimensions"],
-                reasoning_summary=context["reasoning_summary"],
-                overall_confidence=context["confidence"],
-                priority_suggestion=context.get("priority_suggestion"),
-                primary_themes=context.get("primary_themes"),
-                outreach_angles=context.get("suggested_outreach_angles"),
-                reasoning_source=context.get("reasoning_source", "deterministic"),
-                no_opportunity=context.get("no_opportunity", False),
-                no_opportunity_reason=context.get("no_opportunity_reason"),
-                priority_derivation=context.get("priority_derivation"),
-                validation_warnings=context.get("validation_warnings"),
+            semantic = build_semantic_signals(merged)
+            decision = agent.decide(semantic, lead_name=lead.get("name") or "")
+            insert_decision(
+                lead_id=lead_id,
+                agency_type=agency_type,
+                signals_snapshot=semantic,
+                verdict=decision.verdict,
+                confidence=decision.confidence,
+                reasoning=decision.reasoning,
+                primary_risks=decision.primary_risks,
+                what_would_change=decision.what_would_change,
+                prompt_version=agent.prompt_version,
             )
-            final_text = text_to_embed(context)
-            if final_text:
-                final_emb = get_embedding(final_text)
-                if final_emb:
-                    insert_lead_embedding(lead_id, final_emb, final_text)
             if (idx + 1) % progress_interval == 0:
                 logger.info("  Processed %d/%d leads", idx + 1, len(enriched_leads))
         run_stats = _compute_run_stats(signals)
@@ -213,11 +187,11 @@ def run_upload_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Enrich team-uploaded leads (CSV/JSON) with signals, Meta Ads, scoring, context; persist to DB"
+        description="Enrich team-uploaded leads (CSV/JSON) with signals, Meta Ads, Decision Agent; persist to DB"
     )
     parser.add_argument("--upload", "-u", required=True, help="Path to CSV or JSON file (required: name column)")
     parser.add_argument("--max-leads", type=int, default=None, help="Max leads to process")
-    parser.add_argument("--llm-reasoning", action="store_true", help="Refine with LLM (requires OPENAI_API_KEY)")
+    parser.add_argument("--agency-type", choices=("seo", "marketing"), default=None, help="Agency context for Decision Agent (default: AGENCY_TYPE env or 'marketing')")
     parser.add_argument(
         "--no-place-details",
         action="store_true",
@@ -233,10 +207,13 @@ def main():
     if not args.no_place_details and not os.getenv("GOOGLE_PLACES_API_KEY"):
         logger.warning("GOOGLE_PLACES_API_KEY not set; use --no-place-details to run without Place Details")
 
+    agency_type = os.getenv("AGENCY_TYPE", "marketing").lower() or "marketing"
+    if args.agency_type is not None:
+        agency_type = args.agency_type
     n = run_upload_pipeline(
         upload_path=args.upload,
         max_leads=args.max_leads,
-        llm_reasoning=args.llm_reasoning,
+        agency_type=agency_type,
         fetch_place_details=not args.no_place_details,
     )
     logger.info("Done. %d leads processed.", n)
