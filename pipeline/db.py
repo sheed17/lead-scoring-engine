@@ -121,6 +121,8 @@ def init_db() -> None:
             "ALTER TABLE context_dimensions ADD COLUMN validation_warnings TEXT",
             "ALTER TABLE leads ADD COLUMN dentist_profile_v1_json TEXT",
             "ALTER TABLE leads ADD COLUMN llm_reasoning_layer_json TEXT",
+            "ALTER TABLE leads ADD COLUMN sales_intervention_intelligence_json TEXT",
+            "ALTER TABLE leads ADD COLUMN objective_decision_layer_json TEXT",
         ]:
             try:
                 conn.execute(sql)
@@ -303,8 +305,10 @@ def update_lead_dentist_data(
     lead_id: int,
     dentist_profile_v1: Optional[Dict] = None,
     llm_reasoning_layer: Optional[Dict] = None,
+    sales_intervention_intelligence: Optional[Dict] = None,
+    objective_decision_layer: Optional[Dict] = None,
 ) -> None:
-    """Store dentist vertical profile and/or LLM reasoning layer for a lead."""
+    """Store dentist vertical profile, LLM reasoning layer, sales intervention intelligence, and/or objective decision layer for a lead."""
     conn = _get_conn()
     try:
         if dentist_profile_v1 is not None:
@@ -316,6 +320,16 @@ def update_lead_dentist_data(
             conn.execute(
                 "UPDATE leads SET llm_reasoning_layer_json = ? WHERE id = ?",
                 (json.dumps(llm_reasoning_layer, default=str), lead_id),
+            )
+        if sales_intervention_intelligence is not None:
+            conn.execute(
+                "UPDATE leads SET sales_intervention_intelligence_json = ? WHERE id = ?",
+                (json.dumps(sales_intervention_intelligence, default=str), lead_id),
+            )
+        if objective_decision_layer is not None:
+            conn.execute(
+                "UPDATE leads SET objective_decision_layer_json = ? WHERE id = ?",
+                (json.dumps(objective_decision_layer, default=str), lead_id),
             )
         conn.commit()
     except sqlite3.OperationalError:
@@ -629,7 +643,7 @@ def get_leads_with_decisions_by_run(run_id: str) -> List[Dict]:
                 """SELECT l.id AS lead_id, l.run_id, l.place_id, l.name, l.address, l.latitude, l.longitude,
                           ls.signals_json,
                           d.agency_type, d.verdict, d.confidence, d.reasoning, d.primary_risks, d.what_would_change, d.prompt_version,
-                          l.dentist_profile_v1_json, l.llm_reasoning_layer_json
+                          l.dentist_profile_v1_json, l.llm_reasoning_layer_json, l.sales_intervention_intelligence_json, l.objective_decision_layer_json
                    FROM leads l
                    LEFT JOIN lead_signals ls ON ls.lead_id = l.id
                    LEFT JOIN decisions d ON d.lead_id = l.id
@@ -676,6 +690,16 @@ def get_leads_with_decisions_by_run(run_id: str) -> List[Dict]:
             try:
                 if row["llm_reasoning_layer_json"] is not None:
                     lead["llm_reasoning_layer"] = json.loads(row["llm_reasoning_layer_json"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                pass
+            try:
+                if row["sales_intervention_intelligence_json"] is not None:
+                    lead["sales_intervention_intelligence"] = json.loads(row["sales_intervention_intelligence_json"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                pass
+            try:
+                if row["objective_decision_layer_json"] is not None:
+                    lead["objective_decision_layer"] = json.loads(row["objective_decision_layer_json"])
             except (KeyError, TypeError, json.JSONDecodeError):
                 pass
             out.append(lead)

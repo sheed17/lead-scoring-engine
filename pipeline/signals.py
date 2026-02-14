@@ -826,15 +826,18 @@ def _analyze_html_content(html: str) -> Dict:
     has_hiring_text = any(
         re.search(p, html_lower, re.IGNORECASE) for p in HIRING_TEXT_PATTERNS
     )
-    
+    # Link-only rule: href to /careers or /jobs or /hiring → hiring_active = True (no second fetch)
     if has_hiring_links or has_hiring_text:
         hiring_active = True
+        hiring_signal_source = "careers_link_only" if (has_hiring_links and not has_hiring_text) else None
     elif has_substantial_html:
         hiring_active = False
+        hiring_signal_source = None
     else:
         hiring_active = None
+        hiring_signal_source = None
     
-    # Detect specific roles being hired
+    # Detect specific roles being hired (only when we have hiring text to scan)
     detected_roles = []
     if hiring_active:
         for role, patterns in HIRING_ROLE_PATTERNS.items():
@@ -866,6 +869,7 @@ def _analyze_html_content(html: str) -> Dict:
         "paid_ads_channels": detected_ad_channels if detected_ad_channels else None,
         "hiring_active": hiring_active,
         "hiring_roles": detected_roles if detected_roles else None,
+        "hiring_signal_source": hiring_signal_source,
         "has_schema_microdata": has_schema_microdata,
         "schema_types": schema_types,
         # Phase 0.1
@@ -920,6 +924,7 @@ def analyze_website(url: str) -> Dict:
         "paid_ads_channels": None,
         "hiring_active": None,
         "hiring_roles": None,
+        "hiring_signal_source": None,
         "has_schema_microdata": None,
         "schema_types": None,
         "has_social_links": None,
@@ -962,6 +967,7 @@ def analyze_website(url: str) -> Dict:
         signals["paid_ads_channels"] = content_signals["paid_ads_channels"]
         signals["hiring_active"] = content_signals["hiring_active"]
         signals["hiring_roles"] = content_signals["hiring_roles"]
+        signals["hiring_signal_source"] = content_signals.get("hiring_signal_source")
         signals["has_schema_microdata"] = content_signals["has_schema_microdata"]
         signals["schema_types"] = content_signals["schema_types"]
         signals["has_social_links"] = content_signals["has_social_links"]
@@ -1103,6 +1109,7 @@ def extract_signals(lead: Dict) -> Dict:
             "paid_ads_channels": None,
             "hiring_active": None,
             "hiring_roles": None,
+            "hiring_signal_source": None,
             "has_schema_microdata": None,
             "schema_types": None,
             "has_social_links": None,
@@ -1176,6 +1183,7 @@ def extract_signals(lead: Dict) -> Dict:
         # Hiring/growth signals (TIMING indicator)
         "hiring_active": website_signals["hiring_active"],
         "hiring_roles": website_signals["hiring_roles"],
+        "hiring_signal_source": website_signals.get("hiring_signal_source"),
         
         # Schema/microdata (Phase 0)
         "has_schema_microdata": website_signals.get("has_schema_microdata"),

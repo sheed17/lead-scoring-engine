@@ -226,13 +226,20 @@ class PlacesFetcher:
             data = self._make_request(params)
             
             if not data:
+                logger.warning("Places API returned no data (network error or rate limit). Check key and billing.")
                 break
             
             status = data.get("status")
             if status == "ZERO_RESULTS":
-                logger.debug(f"No results for keyword '{keyword}' at ({lat}, {lng})")
+                logger.warning(
+                    "Places API status: ZERO_RESULTS for keyword '%s' at (%.4f, %.4f). "
+                    "Try a larger radius or different location.",
+                    keyword, lat, lng
+                )
                 break
             elif status != "OK":
+                err = data.get("error_message", "")
+                logger.warning("Places API status: %s. %s", status, err or "Check API key, enable Places API, and billing.")
                 break
             
             results = data.get("results", [])

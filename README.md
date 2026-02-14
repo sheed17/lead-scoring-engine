@@ -179,6 +179,69 @@ Built-in keyword expansion:
 - `roofing` - Roofing contractor, roof repair
 - `landscaping` - Landscaping, lawn care
 - `cleaning` - Cleaning service, house cleaning
+- `dentist` / `dental` - Dentist, dental clinic, orthodontist, cosmetic dentist, etc.
+
+## Objective decision layer (dentist / sales)
+
+For dental leads, the pipeline adds an **objective decision layer** that separates demand, capture/visibility, conversion, and trust, picks **one root bottleneck** per lead, and produces a prioritized plan so the system does not over-prescribe (e.g. always “booking friction”).
+
+Outputs include:
+- **root_bottleneck_classification** – One of: `demand_limited`, `visibility_limited`, `conversion_limited`, `trust_limited`, `saturation_limited`, **`differentiation_limited`** (with why, evidence, what would change, confidence). Booking is primary only when demand/capture are adequate, conversion is weak, and differentiation is not already established.
+- **seo_lever_assessment** – `is_primary_growth_lever` (boolean), `confidence`, `reasoning`, `alternative_primary_lever`; when SEO is not the best lever, the alternative is named (e.g. Reputation/trust, Conversion/booking).
+- **demand_capture_conversion_model** – Status (Strong/Moderate/Weak) and evidence for demand, capture, conversion, and trust signals.
+- **comparative_context** – One sentence framing the lead vs nearby dentists (uses competitor sample when available).
+- **primary_sales_anchor** – One issue to lead with, aligned to the root bottleneck (never defaulting to “booking friction” unless the bottleneck is conversion).
+- **intervention_plan** – 3–5 **concrete** actions (implementable, measurable within 60 days), top action addresses the root bottleneck, with “why_not_secondaries_yet” on the first.
+- **access_request_plan** – Minimal access (e.g. GBP Manager, Website Admin) and when to ask.
+- **de_risking_questions** – Up to 3 questions to validate assumptions on the call.
+- **service_intelligence** – High-ticket vs general service pages detected; dedicated vs mentioned; missing high-value pages (when crawl runs).
+- **competitive_snapshot** – Top 5 dentists within 1.5 mi: avg review count/rating, lead review percentile, market density (when lat/lng available).
+- **revenue_leverage_analysis** – Primary revenue driver, estimated revenue asymmetry, highest-leverage growth vector (feeds root bottleneck and seo_best_lever).
+- **seo_sales_value_score** – Internal 0–100 for **prioritization only** (not shown to dentist): high when asymmetry + weak visibility + missing pages; low when saturated + strong reviews + no leverage.
+
+**Root logic and full schema:** See **[docs/OBJECTIVE_DECISION_SCHEMA.md](docs/OBJECTIVE_DECISION_SCHEMA.md)** for when each bottleneck is chosen, JSON shape for all new blocks, and an example upgraded output.
+
+Example shape (per-lead `objective_decision_layer`):
+
+```json
+{
+  "root_bottleneck_classification": {
+    "bottleneck": "visibility_limited",
+    "why_root_cause": "Demand appears present but the practice is not capturing it well.",
+    "evidence": ["Review count vs market: Below Average", "Rating strength: Moderate"],
+    "what_would_change": "Higher review volume or stronger local visibility would shift this.",
+    "confidence": 0.75
+  },
+  "seo_lever_assessment": { "is_primary_growth_lever": true, "confidence": 0.75, "reasoning": "Visibility is the root bottleneck and trust is adequate; SEO is a strong next lever.", "alternative_primary_lever": "" },
+  "demand_capture_conversion_model": {
+    "demand_signals": { "status": "Moderate", "evidence": ["..."], "confidence": 0.6 },
+    "capture_signals": { "status": "Weak", "evidence": ["..."], "confidence": 0.7 },
+    "conversion_signals": { "status": "Moderate", "evidence": ["..."], "confidence": 0.6 },
+    "trust_signals": { "status": "Strong", "evidence": ["..."], "confidence": 0.8 }
+  },
+  "comparative_context": "This profile has below-typical review volume (25 reviews) but recent activity.",
+  "primary_sales_anchor": { "issue": "...", "why_this_first": "...", "what_happens_if_ignored": "...", "confidence": 0.7 },
+  "intervention_plan": [
+    { "priority": 1, "action": "...", "category": "Capture", "expected_impact": "...", "time_to_signal_days": 30, "confidence": 0.7, "why_not_secondaries_yet": "..." }
+  ],
+  "access_request_plan": [
+    { "intervention_ref": "GBP optimization", "access_type": "Google Business Profile – Manager", "why_needed": "...", "risk_level": "Low", "when_to_ask": "After initial agreement" }
+  ],
+  "de_risking_questions": [
+    { "question": "How are new patients finding you today?", "ties_to_uncertainty": "Demand and channel mix" }
+  ]
+}
+```
+
+When service depth and competitor sampling run, the same block also includes `service_intelligence`, `competitive_snapshot`, `revenue_leverage_analysis`, and `seo_sales_value_score` (see [docs/OBJECTIVE_DECISION_SCHEMA.md](docs/OBJECTIVE_DECISION_SCHEMA.md)).
+
+### How sales should use this output in a call
+
+1. **Start with the root bottleneck** – Read `root_bottleneck_classification.why_root_cause` and use the evidence list to frame the conversation (“We’re seeing X; here’s what supports that…”).
+2. **Lead with one anchor only** – Use `primary_sales_anchor.issue` and `why_this_first` as your opening. Do not pitch booking, visibility, and reputation in the same breath.
+3. **Check whether SEO is the right lever** – If `seo_lever_assessment.is_primary_growth_lever` is false, use `seo_lever_assessment.reasoning` and `alternative_primary_lever` to set expectations (“SEO may not be the best first step because…”).
+4. **Use the intervention plan as your roadmap** – After agreement on the anchor, introduce the first action from `intervention_plan` and use `why_not_secondaries_yet` to explain why you’re not adding more at once.
+5. **Ask the de-risking questions** – Use `de_risking_questions` to confirm assumptions (e.g. who runs ads, how patients book, past SEO/review issues) and tighten confidence before proposing next steps.
 
 ## Project Structure
 
@@ -190,7 +253,8 @@ lead-scoring-engine/
 ├── test_enrichment.py           # Test Place Details API
 ├── test_website_signals.py      # Test website signal extraction
 ├── docs/
-│   └── EXAMPLES_AND_INTERNALS.md
+│   ├── EXAMPLES_AND_INTERNALS.md
+│   └── OBJECTIVE_DECISION_SCHEMA.md   # Root logic, schema, example (dental)
 ├── pipeline/
 │   ├── __init__.py
 │   ├── geo.py                   # Geographic grid generation
@@ -204,6 +268,9 @@ lead-scoring-engine/
 │   ├── context.py              # Context-first interpreter (6 dimensions)
 │   ├── opportunities.py        # Opportunity intelligence
 │   ├── score.py                 # Lead scoring & priority
+│   ├── service_depth.py        # Service page detection (high-ticket, missing pages)
+│   ├── competitor_sampling.py  # Nearby Search 1.5 mi, competitive snapshot
+│   ├── revenue_leverage.py      # Revenue asymmetry, seo_sales_value_score
 │   ├── llm_reasoning.py         # Optional LLM refinement (--llm-reasoning)
 │   ├── embeddings.py            # Embeddings for RAG
 │   ├── db.py                    # SQLite persistence (runs, leads, context)

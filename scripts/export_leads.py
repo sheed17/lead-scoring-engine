@@ -33,6 +33,7 @@ from pipeline.db import (
     get_leads_with_decisions_by_run,
     get_leads_with_decisions_deduped_by_place_id,
 )
+from pipeline.sixty_second_summary import build_sixty_second_summary
 
 
 def find_latest_file(input_dir: str = "output") -> str:
@@ -237,9 +238,30 @@ def export_to_csv(leads: list, output_path: str):
 # CONTEXT-FIRST EXPORT (default, from DB)
 # =============================================================================
 
-def _clean_lead_decision_for_export(lead: dict) -> dict:
-    """One row for decision-first export (from get_leads_with_decisions_by_run)."""
+def _ensure_sixty_second_summary(lead: dict) -> dict:
+    """Get or compute sixty_second_summary for a lead."""
+    if lead.get("sixty_second_summary"):
+        return lead["sixty_second_summary"]
+    return build_sixty_second_summary(lead)
+
+
+def _clean_lead_decision_for_export(lead: dict, summary_only: bool = False) -> dict:
+    """One row for decision-first export. summary_only=True: only name, address, sixty_second_summary."""
+    summary = _ensure_sixty_second_summary(lead)
+    score = summary.get("seo_priority_score", 50)
+
+    if summary_only:
+        return {
+            "name": lead.get("name"),
+            "address": lead.get("address"),
+            "sixty_second_summary": summary,
+        }
+    # Ordered for 60-second usability: summary first, then verdict/confidence, then deep blocks
     out = {
+        "name": lead.get("name"),
+        "address": lead.get("address"),
+        "sixty_second_summary": summary,
+        "seo_priority_score": score,
         "verdict": lead.get("verdict"),
         "confidence": lead.get("confidence"),
         "reasoning": lead.get("reasoning", ""),
@@ -248,10 +270,17 @@ def _clean_lead_decision_for_export(lead: dict) -> dict:
         "agency_type": lead.get("agency_type"),
         "prompt_version": lead.get("prompt_version"),
         "place_id": lead.get("place_id"),
-        "name": lead.get("name"),
-        "address": lead.get("address"),
         "raw_signals": lead.get("raw_signals", {}),
     }
+    if lead.get("objective_decision_layer") is not None:
+        out["objective_decision_layer"] = lead["objective_decision_layer"]
+        out["root_bottleneck"] = (lead["objective_decision_layer"].get("root_bottleneck_classification") or {}).get("bottleneck", "")
+        if lead["objective_decision_layer"].get("service_intelligence") is not None:
+            out["service_intelligence"] = lead["objective_decision_layer"]["service_intelligence"]
+        if lead["objective_decision_layer"].get("competitive_snapshot") is not None:
+            out["competitive_snapshot"] = lead["objective_decision_layer"]["competitive_snapshot"]
+    else:
+        out["root_bottleneck"] = ""
     if lead.get("dentist_profile_v1") is not None:
         out["dentist_profile_v1"] = lead["dentist_profile_v1"]
     if lead.get("llm_reasoning_layer") is not None:
@@ -259,6 +288,12 @@ def _clean_lead_decision_for_export(lead: dict) -> dict:
         out["llm_executive_summary"] = (lead["llm_reasoning_layer"].get("executive_summary") or "")[:500]
     else:
         out["llm_executive_summary"] = ""
+    if lead.get("sales_intervention_intelligence") is not None:
+        out["sales_intervention_intelligence"] = lead["sales_intervention_intelligence"]
+        anchor = (lead["sales_intervention_intelligence"].get("primary_sales_anchor") or {}).get("issue")
+        out["sales_primary_anchor"] = (anchor or "")[:200]
+    else:
+        out["sales_primary_anchor"] = ""
     return out
 
 
@@ -290,28 +325,12 @@ def _clean_lead_context_for_export(lead: dict) -> dict:
     return out
 
 
-def export_context_to_json(leads: list, output_path: str, decision_first: bool = True):
-    """Export leads to JSON. decision_first=True (default): verdict, reasoning, primary_risks, what_would_change."""
+def export_context_to_json(leads: list, output_path: str, decision_first: bool = True, summary_only: bool = False):
+    """Export leads to JSON. decision_first: verdict, reasoning, etc. summary_only: only name, address, sixty_second_summary."""
     clean = []
     for lead in leads:
         if decision_first and lead.get("verdict") is not None:
-            row = {
-                "verdict": lead.get("verdict"),
-                "confidence": lead.get("confidence"),
-                "reasoning": lead.get("reasoning", ""),
-                "primary_risks": lead.get("primary_risks", []),
-                "what_would_change": lead.get("what_would_change", []),
-                "agency_type": lead.get("agency_type"),
-                "prompt_version": lead.get("prompt_version"),
-                "place_id": lead.get("place_id"),
-                "name": lead.get("name"),
-                "address": lead.get("address"),
-                "raw_signals": lead.get("raw_signals", {}),
-            }
-            if lead.get("dentist_profile_v1") is not None:
-                row["dentist_profile_v1"] = lead["dentist_profile_v1"]
-            if lead.get("llm_reasoning_layer") is not None:
-                row["llm_reasoning_layer"] = lead["llm_reasoning_layer"]
+            row = _clean_lead_decision_for_export(lead, summary_only=summary_only)
             clean.append(row)
         else:
             clean.append({
@@ -324,19 +343,39 @@ def export_context_to_json(leads: list, output_path: str, decision_first: bool =
                 "confidence": lead.get("confidence"),
                 "raw_signals": lead.get("raw_signals", {}),
             })
-    clean.sort(key=lambda x: (x.get("confidence") or 0), reverse=True)
+    # Sort by sales priority (seo_priority_score) descending; fallback to confidence
+    clean.sort(
+        key=lambda x: (x.get("seo_priority_score") if "seo_priority_score" in x else x.get("sixty_second_summary", {}).get("seo_priority_score") if isinstance(x.get("sixty_second_summary"), dict) else x.get("confidence") or 0),
+        reverse=True,
+    )
     data = {"exported_at": datetime.utcnow().isoformat(), "total_leads": len(clean), "leads": clean}
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    print(f"Exported {len(clean)} leads (decision-first) to: {output_path}")
+    print(f"Exported {len(clean)} leads (decision-first{' summary-only' if summary_only else ''}) to: {output_path}")
     return output_path
 
 
-def export_context_to_csv(leads: list, output_path: str, decision_first: bool = True):
-    """Export leads to CSV (flattened). decision_first=True: verdict, reasoning, primary_risks, what_would_change."""
+def export_context_to_csv(leads: list, output_path: str, decision_first: bool = True, summary_only: bool = False):
+    """Export leads to CSV (flattened). summary_only: name, address, sixty_second_summary (flattened)."""
     if decision_first and leads and leads[0].get("verdict") is not None:
-        clean = [_clean_lead_decision_for_export(lead) for lead in leads]
-        fieldnames = [k for k in clean[0].keys() if k not in ("raw_signals", "dentist_profile_v1", "llm_reasoning_layer")]
+        clean = [_clean_lead_decision_for_export(lead, summary_only=summary_only) for lead in leads]
+        clean.sort(
+            key=lambda x: (x.get("seo_priority_score") if "seo_priority_score" in x else x.get("sixty_second_summary", {}).get("seo_priority_score") if isinstance(x.get("sixty_second_summary"), dict) else 0),
+            reverse=True,
+        )
+        if summary_only:
+            # Flatten sixty_second_summary for CSV: prefix keys
+            rows = []
+            for r in clean:
+                flat = {"name": r.get("name"), "address": r.get("address")}
+                ss = r.get("sixty_second_summary") or {}
+                for k, v in ss.items():
+                    flat[f"sixty_second_summary.{k}"] = v
+                rows.append(flat)
+            clean = rows
+            fieldnames = list(clean[0].keys()) if clean else []
+        else:
+            fieldnames = [k for k in clean[0].keys() if k not in ("raw_signals", "dentist_profile_v1", "llm_reasoning_layer", "sales_intervention_intelligence", "objective_decision_layer", "service_intelligence", "competitive_snapshot")]
     else:
         clean = [_clean_lead_context_for_export(lead) for lead in leads]
         fieldnames = [k for k in clean[0].keys() if k not in ("context_dimensions", "raw_signals")]
@@ -347,7 +386,7 @@ def export_context_to_csv(leads: list, output_path: str, decision_first: bool = 
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(clean)
-    print(f"Exported {len(clean)} leads (decision-first) to: {output_path}")
+    print(f"Exported {len(clean)} leads (decision-first{' summary-only' if summary_only else ''}) to: {output_path}")
     return output_path
 
 
@@ -380,6 +419,11 @@ def main():
         "--dedupe-by-place-id",
         action="store_true",
         help="Export one lead per place_id (latest run wins); use with context-first export"
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Export only name, address, and sixty_second_summary per lead (60-second view)"
     )
     
     args = parser.parse_args()
@@ -414,10 +458,11 @@ def main():
             print(f"Found {len(leads)} leads (decision-first export)")
         prefix = args.output or "context_export"
         decision_first = bool(leads and leads[0].get("verdict") is not None)
+        summary_only = getattr(args, "summary_only", False)
         if args.format in ["json", "both"]:
-            export_context_to_json(leads, f"output/{prefix}_{timestamp}.json", decision_first=decision_first)
+            export_context_to_json(leads, f"output/{prefix}_{timestamp}.json", decision_first=decision_first, summary_only=summary_only)
         if args.format in ["csv", "both"]:
-            export_context_to_csv(leads, f"output/{prefix}_{timestamp}.csv", decision_first=decision_first)
+            export_context_to_csv(leads, f"output/{prefix}_{timestamp}.csv", decision_first=decision_first, summary_only=summary_only)
     
     print("\nExport complete!")
 

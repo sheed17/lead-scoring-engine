@@ -53,6 +53,8 @@ from .export import export_to_json, export_to_csv, to_db_records
 from .score import score_lead, score_leads_batch, get_scoring_summary, ScoringResult
 from .dentist_profile import is_dental_practice, build_dentist_profile_v1, fetch_website_html_for_trust
 from .dentist_llm_reasoning import dentist_llm_reasoning_layer
+from .sales_intervention import build_sales_intervention_intelligence
+from .objective_decision_layer import compute_objective_decision_layer
 
 __all__ = [
     # geo
@@ -108,4 +110,6 @@ __all__ = [
     "build_dentist_profile_v1",
     "fetch_website_html_for_trust",
     "dentist_llm_reasoning_layer",
+    "build_sales_intervention_intelligence",
+    "compute_objective_decision_layer",
 ]

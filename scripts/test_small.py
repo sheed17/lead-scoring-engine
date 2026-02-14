@@ -31,6 +31,13 @@ from datetime import datetime
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load .env so GOOGLE_PLACES_API_KEY and OPENAI_API_KEY work without exporting in every shell
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+except ImportError:
+    pass
+
 from pipeline.fetch import PlacesFetcher
 from pipeline.normalize import normalize_place, deduplicate_places
 from pipeline.enrich import PlaceDetailsEnricher
@@ -45,6 +52,11 @@ from pipeline.dentist_profile import (
     fetch_website_html_for_trust,
 )
 from pipeline.dentist_llm_reasoning import dentist_llm_reasoning_layer
+from pipeline.sales_intervention import build_sales_intervention_intelligence
+from pipeline.objective_decision_layer import compute_objective_decision_layer
+from pipeline.service_depth import build_service_intelligence
+from pipeline.competitor_sampling import fetch_competitors_nearby, build_competitive_snapshot
+from pipeline.sixty_second_summary import build_sixty_second_summary
 
 # Configure logging
 logging.basicConfig(
@@ -113,7 +125,11 @@ def run_small_test():
     logger.info(f"  Results fetched: {len(raw_places)}")
     
     if not raw_places:
-        logger.error("No places found! Check API key and location.")
+        logger.error(
+            "No places found! Common causes: (1) GOOGLE_PLACES_API_KEY missing or wrong in this shell "
+            "or .env, (2) Places API not enabled or billing not set in Google Cloud, (3) Key restrictions "
+            "blocking this environment. Check any WARNING above for API status."
+        )
         sys.exit(1)
     
     # =========================================
@@ -222,9 +238,9 @@ def run_small_test():
         website_html = fetch_website_html_for_trust(url) if url else None
         dentist_profile_v1 = build_dentist_profile_v1(lead, website_html=website_html)
         lead["dentist_profile_v1"] = dentist_profile_v1
+        context = build_context(lead) if dentist_profile_v1 else {}
         llm_layer = {}
         if dentist_profile_v1:
-            context = build_context(lead)
             lead_score = round((lead.get("confidence") or 0) * 100)
             llm_layer = dentist_llm_reasoning_layer(
                 business_snapshot=lead,
@@ -235,12 +251,43 @@ def run_small_test():
                 confidence=lead.get("confidence"),
             )
         lead["llm_reasoning_layer"] = llm_layer if llm_layer else {}
+        # Sales & Intervention Intelligence (conversation anchor, intervention plan, access, objections, GTM)
+        sales_intel = build_sales_intervention_intelligence(
+            business_snapshot=lead,
+            dentist_profile_v1=dentist_profile_v1,
+            context_dimensions=context.get("context_dimensions", []) if context else [],
+            verdict=lead.get("verdict"),
+            confidence=lead.get("confidence"),
+            llm_reasoning_layer=lead.get("llm_reasoning_layer"),
+        )
+        lead["sales_intervention_intelligence"] = sales_intel if sales_intel else {}
         logger.info(f"  ✓ {lead['name'][:40]} (dental)")
         if dentist_profile_v1:
             af = dentist_profile_v1.get("agency_fit_reasoning", {})
             logger.info(f"    ideal_for_seo_outreach=%s | LTV=%s", af.get("ideal_for_seo_outreach"), dentist_profile_v1.get("dental_practice_profile", {}).get("estimated_ltv_class"))
         if llm_layer and llm_layer.get("executive_summary"):
             logger.info(f"    LLM summary: %s", (llm_layer["executive_summary"][:80] + "...") if len(llm_layer["executive_summary"]) > 80 else llm_layer["executive_summary"])
+        if sales_intel and sales_intel.get("primary_sales_anchor", {}).get("issue"):
+            logger.info(f"    Primary anchor: %s", (sales_intel["primary_sales_anchor"]["issue"][:60] + "...") if len(sales_intel["primary_sales_anchor"]["issue"]) > 60 else sales_intel["primary_sales_anchor"]["issue"])
+        # Service depth (homepage + nav), competitor sampling (1.5 mi), then objective decision layer
+        procedure_mentions = (dentist_profile_v1.get("review_intent_analysis") or {}).get("procedure_mentions") or []
+        service_intel = build_service_intelligence(lead.get("signal_website_url"), website_html, procedure_mentions)
+        competitors = []
+        lat, lng = lead.get("latitude"), lead.get("longitude")
+        if lat is not None and lng is not None:
+            competitors = fetch_competitors_nearby(lat, lng, lead.get("place_id"))
+        competitive_snap = build_competitive_snapshot(lead, competitors) if competitors else {}
+        obj_layer = compute_objective_decision_layer(
+            lead,
+            service_intelligence=service_intel,
+            competitive_snapshot=competitive_snap if competitors else None,
+            revenue_leverage=None,
+        )
+        lead["objective_decision_layer"] = obj_layer if obj_layer else {}
+        lead["sixty_second_summary"] = build_sixty_second_summary(lead)
+        if obj_layer and obj_layer.get("root_bottleneck_classification"):
+            seo_assess = obj_layer.get("seo_lever_assessment") or {}
+            logger.info(f"    Root bottleneck: %s | SEO primary lever: %s", obj_layer["root_bottleneck_classification"].get("bottleneck"), seo_assess.get("is_primary_growth_lever"))
     logger.info(f"  Dental leads with profile: {dentist_count}/{len(final_leads)}")
     
     # =========================================
@@ -307,7 +354,7 @@ def run_small_test():
                       "place_id", "name", "address",
                       "verdict", "confidence", "reasoning",
                       "primary_risks", "what_would_change", "agency_type",
-                      "dentist_profile_v1", "llm_reasoning_layer",
+                      "dentist_profile_v1", "llm_reasoning_layer", "sales_intervention_intelligence", "objective_decision_layer",
                   ) or k.startswith("signal_")}
         print(json.dumps(sample, indent=2, default=str))
     

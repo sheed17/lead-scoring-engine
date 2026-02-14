@@ -62,6 +62,10 @@ from pipeline.dentist_profile import (
     fetch_website_html_for_trust,
 )
 from pipeline.dentist_llm_reasoning import dentist_llm_reasoning_layer
+from pipeline.sales_intervention import build_sales_intervention_intelligence
+from pipeline.objective_decision_layer import compute_objective_decision_layer
+from pipeline.service_depth import build_service_intelligence
+from pipeline.competitor_sampling import fetch_competitors_nearby, build_competitive_snapshot
 
 # Configure logging
 logging.basicConfig(
@@ -436,10 +440,38 @@ def run_enrichment_pipeline(
                         priority=decision.verdict,
                         confidence=decision.confidence,
                     )
+                    sales_intel = build_sales_intervention_intelligence(
+                        business_snapshot=merged,
+                        dentist_profile_v1=dentist_profile_v1,
+                        context_dimensions=context.get("context_dimensions", []),
+                        verdict=decision.verdict,
+                        confidence=decision.confidence,
+                        llm_reasoning_layer=llm_reasoning_layer,
+                    )
+                    # Service depth + competitor sampling + objective decision layer
+                    merged["dentist_profile_v1"] = dentist_profile_v1
+                    procedure_mentions = (dentist_profile_v1.get("review_intent_analysis") or {}).get("procedure_mentions") or []
+                    service_intel = build_service_intelligence(url, website_html, procedure_mentions)
+                    competitors = []
+                    lat, lng = merged.get("latitude"), merged.get("longitude")
+                    if lat is not None and lng is not None:
+                        competitors = fetch_competitors_nearby(lat, lng, merged.get("place_id"))
+                    competitive_snap = build_competitive_snapshot(merged, competitors) if competitors else {}
+                    obj_layer = compute_objective_decision_layer(
+                        merged,
+                        service_intelligence=service_intel,
+                        competitive_snapshot=competitive_snap if competitors else None,
+                        revenue_leverage=None,
+                    )
+                else:
+                    sales_intel = None
+                    obj_layer = None
                 update_lead_dentist_data(
                     lead_id,
                     dentist_profile_v1=dentist_profile_v1,
                     llm_reasoning_layer=llm_reasoning_layer if llm_reasoning_layer else None,
+                    sales_intervention_intelligence=sales_intel if sales_intel else None,
+                    objective_decision_layer=obj_layer if obj_layer else None,
                 )
             if (idx + 1) % CONFIG["progress_interval"] == 0:
                 logger.info(f"  Decision + DB: {idx + 1}/{len(enriched_leads)} leads")
