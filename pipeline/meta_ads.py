@@ -16,7 +16,7 @@ existing signal unchanged).
 import os
 import time
 import logging
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 
 import requests
 
@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Meta Graph API
 META_ADS_ARCHIVE_URL = "https://graph.facebook.com/v21.0/ads_archive"
+
+# Fields for structured paid intelligence (creation time, body, link caption, snapshot)
+META_ADS_ARCHIVE_FIELDS = "ad_creation_time,ad_creative_body,ad_creative_link_caption,ad_snapshot_url"
 
 # Rate limit: avoid 613 (too many calls). Be conservative.
 META_REQUEST_DELAY_SEC = 0.5
@@ -148,39 +151,133 @@ def check_meta_ads(
         }
 
 
-def augment_lead_with_meta_ads(lead: Dict, delay_seconds: float = META_REQUEST_DELAY_SEC) -> None:
+def fetch_ads_archive_detailed(
+    business_name: str,
+    country: str = "US",
+    ad_type: str = "ALL",
+    fields: Optional[str] = None,
+) -> Dict:
     """
-    If META_ACCESS_TOKEN is set, query Ads Library by lead name and
-    update lead's paid-ads signals when we get a hit.
+    Query Ads Library with optional fields for structured intelligence.
+    Returns full API response with data[] (list of ad objects) for downstream extraction.
+    """
+    token = get_meta_access_token()
+    if not token:
+        return {"data": [], "source": "meta_ads_library", "error": "META_ACCESS_TOKEN not set"}
 
-    Updates in place:
-    - signal_runs_paid_ads = True if Meta returns ads (never set False).
-    - signal_paid_ads_channels: add "meta" if not already present.
-    - signal_meta_ads_source: "meta_ads_library" when we used the API.
+    search_terms = (business_name or "").strip()[:100]
+    if not search_terms:
+        return {"data": [], "source": "meta_ads_library", "error": "No business name to search"}
 
-    When token is missing or API returns no ads, existing signals are
-    left unchanged (website pixel detection remains the source).
+    params = {
+        "access_token": token,
+        "ad_reached_countries": f'["{country}"]',
+        "ad_type": ad_type,
+        "search_terms": search_terms,
+    }
+    if fields:
+        params["fields"] = fields
+
+    try:
+        resp = requests.get(META_ADS_ARCHIVE_URL, params=params, timeout=REQUEST_TIMEOUT)
+        data = resp.json()
+        if "error" in data:
+            return {
+                "data": [],
+                "source": "meta_ads_library",
+                "error": data["error"].get("message", "Unknown error"),
+            }
+        return {
+            "data": data.get("data") or [],
+            "paging": data.get("paging"),
+            "source": "meta_ads_library",
+        }
+    except requests.exceptions.RequestException as e:
+        logger.debug("Meta Ads Library detailed request failed: %s", e)
+        return {"data": [], "source": "meta_ads_library", "error": str(e)}
+
+
+def augment_lead_with_meta_ads(
+    lead: Dict,
+    delay_seconds: float = META_REQUEST_DELAY_SEC,
+    build_paid_intelligence_block: bool = True,
+) -> None:
+    """
+    If META_ACCESS_TOKEN is set, query Ads Library by lead name (with optional
+    detailed fields for paid_intelligence). Update paid-ads signals and optionally
+    attach paid_intelligence.
+
+    When build_paid_intelligence_block=True, fetches with ad_creation_time,
+    ad_creative_body, etc., builds paid_intelligence (deterministic + optional LLM
+    when ads found), and sets lead["paid_intelligence"]. No raw creative in output.
     """
     if not get_meta_access_token():
         return
 
     name = lead.get("name") or ""
-    result = check_meta_ads(business_name=name, country="US", ad_type="ALL")
+    if build_paid_intelligence_block:
+        response = fetch_ads_archive_detailed(
+            business_name=name,
+            country="US",
+            ad_type="ALL",
+            fields=META_ADS_ARCHIVE_FIELDS,
+        )
+        ad_list = response.get("data") or []
+        ad_count = len(ad_list)
+        if ad_count > 0:
+            lead["signal_runs_paid_ads"] = True
+            channels = lead.get("signal_paid_ads_channels")
+            if isinstance(channels, list):
+                if "meta" not in channels:
+                    lead["signal_paid_ads_channels"] = channels + ["meta"]
+            else:
+                lead["signal_paid_ads_channels"] = ["meta"]
+            lead["signal_meta_ads_source"] = "meta_ads_library"
+            lead["signal_meta_ads_count"] = ad_count
+            try:
+                from pipeline.paid_intelligence import build_paid_intelligence
+                lead["paid_intelligence"] = build_paid_intelligence(lead, response, use_llm=True)
+            except Exception as e:
+                logger.debug("build_paid_intelligence failed: %s", e)
+                try:
+                    lead["paid_intelligence"] = build_paid_intelligence(lead, {"data": ad_list}, use_llm=False)
+                except Exception:
+                    lead["paid_intelligence"] = _empty_paid_intelligence()
+            logger.info("  Meta Ads Library: %s — %d ad(s) found", name[:40], ad_count)
+        else:
+            lead["paid_intelligence"] = _empty_paid_intelligence()
+            err = response.get("error") or "no ads in library"
+            logger.info("  Meta Ads Library: %s — %s", name[:40], err)
+    else:
+        result = check_meta_ads(business_name=name, country="US", ad_type="ALL")
+        ad_count = result.get("ad_count", 0)
+        if result.get("runs_meta_ads") is True:
+            lead["signal_runs_paid_ads"] = True
+            channels = lead.get("signal_paid_ads_channels")
+            if isinstance(channels, list):
+                if "meta" not in channels:
+                    lead["signal_paid_ads_channels"] = channels + ["meta"]
+            else:
+                lead["signal_paid_ads_channels"] = ["meta"]
+            lead["signal_meta_ads_source"] = "meta_ads_library"
+            lead["signal_meta_ads_count"] = ad_count
+            logger.info("  Meta Ads Library: %s — %d ad(s) found", name[:40], ad_count)
+        else:
+            err = result.get("error") or "no ads in library"
+            logger.info("  Meta Ads Library: %s — %s", name[:40], err)
 
     time.sleep(delay_seconds)
 
-    ad_count = result.get("ad_count", 0)
-    if result.get("runs_meta_ads") is True:
-        lead["signal_runs_paid_ads"] = True
-        channels = lead.get("signal_paid_ads_channels")
-        if isinstance(channels, list):
-            if "meta" not in channels:
-                lead["signal_paid_ads_channels"] = channels + ["meta"]
-        else:
-            lead["signal_paid_ads_channels"] = ["meta"]
-        lead["signal_meta_ads_source"] = "meta_ads_library"
-        lead["signal_meta_ads_count"] = ad_count
-        logger.info("  Meta Ads Library: %s — %d ad(s) found", name[:40], ad_count)
-    else:
-        err = result.get("error") or "no ads in library"
-        logger.info("  Meta Ads Library: %s — %s", name[:40], err)
+
+def _empty_paid_intelligence() -> Dict[str, Any]:
+    return {
+        "active_ads": 0,
+        "ad_duration_days": 0,
+        "primary_service_promoted": None,
+        "offer_detected": False,
+        "high_ticket_focus": False,
+        "cta_type": None,
+        "confidence": 0,
+    }
+
+

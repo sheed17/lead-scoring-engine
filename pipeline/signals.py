@@ -59,10 +59,41 @@ AUTOMATED_SCHEDULING_PATTERNS = [
     r'schedulicity\.com',
     r'simplybook\.me',
     r'appointy\.com',
+    # Dental / healthcare booking
+    r'zocdoc\.com',
+    r'nexhealth\.com',
+    r'localmed\.com',
+    r'solutionreach\.com',
+    r'doctible\.com',
+    r'patientpop\.com',
+    r'lumahealth\.io',
+    r'weave\.com',
+    r'demandforce\.com',
     
     # Booking platforms (less common for HVAC)
     r'booksy\.com',
     r'vagaro\.com',
+]
+
+# Booking conversion path (dentist-realistic): detect path type from page
+BOOKING_CONVERSION_PATH_FULL = [
+    r"book\s*now",
+    r"book\s*online",
+    r"book\s*an?\s*appointment",
+    r"schedule\s*now",
+    r"schedule\s*online",
+    r"appointment\s*request",  # often leads to scheduler
+]
+BOOKING_CONVERSION_PATH_REQUEST = [
+    r"request\s*appointment",
+    r"request\s*a\s*visit",
+    r"schedule\s*request",
+    r"contact\s*us\s*for\s*appointment",
+]
+BOOKING_CONVERSION_PATH_PHONE_ONLY = [
+    r"call\s*to\s*schedule",
+    r"phone\s*only",
+    r"call\s*for\s*appointment",
 ]
 
 # =============================================================================
@@ -781,11 +812,26 @@ def _analyze_html_content(html: str) -> Dict:
     if has_scheduling_evidence:
         has_automated_scheduling = True
     elif has_substantial_html:
-        # Page analyzed, no scheduling tools found - can set false
-        # (This is different from contact form - scheduling tools are explicit)
         has_automated_scheduling = False
     else:
         has_automated_scheduling = None
+
+    # =========================================================================
+    # BOOKING CONVERSION PATH (dentist-realistic: Phone-only | Request form | Online booking limited/full)
+    # =========================================================================
+    booking_conversion_path = None
+    if has_substantial_html:
+        has_full_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_FULL)
+        has_request_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_REQUEST)
+        has_phone_only_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_PHONE_ONLY)
+        if has_scheduling_evidence and has_full_cta:
+            booking_conversion_path = "Online booking (full)"
+        elif has_scheduling_evidence:
+            booking_conversion_path = "Online booking (limited)"
+        elif has_request_cta or (has_contact_form and not has_scheduling_evidence):
+            booking_conversion_path = "Request form"
+        elif has_phone_only_cta or (not has_contact_form and not has_scheduling_evidence):
+            booking_conversion_path = "Phone-only"
     
     # =========================================================================
     # TRUST BADGES: Established business indicator
@@ -863,6 +909,7 @@ def _analyze_html_content(html: str) -> Dict:
         "has_email": has_email,
         "email_address": email_address,
         "has_automated_scheduling": has_automated_scheduling,
+        "booking_conversion_path": booking_conversion_path,
         "has_trust_badges": has_trust_badges,
         # New signal families
         "runs_paid_ads": runs_paid_ads,
@@ -916,6 +963,7 @@ def analyze_website(url: str) -> Dict:
         "has_email": None,             # Unknown until HTML analyzed (NEVER false)
         "email_address": None,
         "has_automated_scheduling": None,
+        "booking_conversion_path": None,
         "has_trust_badges": None,
         "page_load_time_ms": None,
         "website_accessible": None,
@@ -961,6 +1009,7 @@ def analyze_website(url: str) -> Dict:
         signals["has_email"] = content_signals["has_email"]
         signals["email_address"] = content_signals["email_address"]
         signals["has_automated_scheduling"] = content_signals["has_automated_scheduling"]
+        signals["booking_conversion_path"] = content_signals.get("booking_conversion_path")
         signals["has_trust_badges"] = content_signals["has_trust_badges"]
         # New signal families
         signals["runs_paid_ads"] = content_signals["runs_paid_ads"]
@@ -1102,6 +1151,7 @@ def extract_signals(lead: Dict) -> Dict:
             "has_email": None,           # Unknown (NEVER false)
             "email_address": None,
             "has_automated_scheduling": None,
+            "booking_conversion_path": None,
             "has_trust_badges": None,
             "page_load_time_ms": None,
             "website_accessible": None,
@@ -1169,6 +1219,7 @@ def extract_signals(lead: Dict) -> Dict:
         
         # Operational maturity - can be false (explicit signal)
         "has_automated_scheduling": website_signals["has_automated_scheduling"],
+        "booking_conversion_path": website_signals.get("booking_conversion_path"),
         
         # Trust/reputation signals
         "has_trust_badges": website_signals["has_trust_badges"],

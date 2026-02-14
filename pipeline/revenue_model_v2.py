@@ -1,0 +1,222 @@
+"""
+Revenue model v2: tier-based annual revenue bands, capped organic gap, confidence score.
+
+Deterministic, versioned, calibratable. No LLM. No linear review_count * multiplier.
+"""
+
+from typing import Dict, Any, List, Optional, Tuple
+
+REVENUE_MODEL_VERSION = "v2"
+
+# Floor for operating dentist (annual USD)
+REVENUE_FLOOR_LOWER = 300_000
+REVENUE_FLOOR_UPPER = 400_000
+
+
+def _get_review_count(context: Dict) -> int:
+    return int(context.get("signal_review_count") or context.get("user_ratings_total") or 0)
+
+
+def _base_revenue_band(review_count: int) -> Tuple[int, int]:
+    """Tier-based annual revenue band (lower, upper) in USD. Not linear in review count."""
+    if review_count < 30:
+        return (400_000, 900_000)
+    if review_count < 150:
+        return (900_000, 1_800_000)
+    if review_count < 400:
+        return (1_500_000, 2_800_000)
+    return (2_500_000, 4_000_000)
+
+
+def _high_ticket_emphasized(high_ticket_procedures: List[Any]) -> bool:
+    """True if implants or invisalign explicitly present (high-ticket emphasis)."""
+    if not high_ticket_procedures:
+        return False
+    for p in high_ticket_procedures:
+        s = (p.get("procedure") if isinstance(p, dict) else p) or ""
+        s = str(s).lower()
+        if "implant" in s or "invisalign" in s:
+            return True
+    return False
+
+
+def _apply_revenue_adjustments(
+    lower: int,
+    upper: int,
+    high_ticket_emphasized: bool,
+    multiple_locations: bool,
+    staff_count: Optional[int],
+    high_income_metro: bool = False,
+) -> Tuple[int, int]:
+    """Apply proportional adjustments. Each modifier adds a percentage to the band."""
+    mult = 1.0
+    if high_ticket_emphasized:
+        mult += 0.15
+    if multiple_locations:
+        mult += 0.20
+    if staff_count is not None and staff_count >= 3:
+        mult += 0.10
+    if high_income_metro:
+        mult += 0.10
+    return (int(round(lower * mult, 0)), int(round(upper * mult, 0)))
+
+
+def _organic_gap_percentage(
+    missing_high_value_pages: bool,
+    ads_active: bool,
+) -> Tuple[float, float]:
+    """Return (gap_pct_low, gap_pct_high) for organic revenue gap."""
+    if missing_high_value_pages and ads_active:
+        return (0.15, 0.20)
+    if missing_high_value_pages:
+        return (0.08, 0.12)
+    return (0.03, 0.07)
+
+
+def _cap_organic_gap(
+    gap_lower: float,
+    gap_upper: float,
+    revenue_band_upper: int,
+    max_gap_pct: float = 0.30,
+) -> Tuple[int, int]:
+    """Hard cap: organic_gap_upper must not exceed max_gap_pct of revenue_band_upper."""
+    cap = int(revenue_band_upper * max_gap_pct)
+    gap_upper_capped = min(int(round(gap_upper, 0)), cap)
+    gap_lower_capped = min(int(round(gap_lower, 0)), cap)
+    if gap_lower_capped > gap_upper_capped:
+        gap_lower_capped = gap_upper_capped
+    return (gap_lower_capped, gap_upper_capped)
+
+
+def _revenue_confidence_score(
+    context: Dict,
+    dentist_profile: Dict,
+    objective_layer: Dict,
+    high_ticket_emphasized: bool,
+    multiple_locations: bool,
+    staff_count: Optional[int],
+    pricing_page_detected: bool,
+) -> int:
+    """0-100. Higher if staff_count, multi_location, pricing page, high-ticket. Lower if no website, very low reviews, no service clarity."""
+    score = 50
+    if staff_count is not None:
+        score += 10
+    if multiple_locations:
+        score += 10
+    if pricing_page_detected:
+        score += 10
+    if high_ticket_emphasized:
+        score += 10
+    if not context.get("signal_has_website"):
+        score -= 25
+    review_count = _get_review_count(context)
+    if review_count < 15:
+        score -= 15
+    elif review_count < 30:
+        score -= 5
+    svc = (objective_layer or {}).get("service_intelligence") or {}
+    high_ticket = svc.get("high_ticket_procedures_detected") or []
+    general = svc.get("general_services_detected") or []
+    if not high_ticket and not general:
+        score -= 15
+    return max(0, min(100, score))
+
+
+def compute_revenue_v2(
+    context: Dict[str, Any],
+    dentist_profile: Dict[str, Any],
+    objective_layer: Dict[str, Any],
+    high_income_metro: bool = False,
+    pricing_page_detected: bool = False,
+) -> Dict[str, Any]:
+    """
+    Tier-based revenue model v2.
+
+    Returns:
+        revenue_band_estimate: { lower, upper, currency, period }
+        organic_revenue_gap_estimate: { lower, upper, ... } or None
+        revenue_confidence_score: 0-100
+        model_version: "v2"
+    """
+    obj = objective_layer or {}
+    svc = obj.get("service_intelligence") or {}
+    high_ticket = svc.get("high_ticket_procedures_detected") or []
+    missing_pages = svc.get("missing_high_value_pages") or []
+    missing_high_value = bool(missing_pages)
+    ads_active = context.get("signal_runs_paid_ads") is True
+
+    review_count = _get_review_count(context)
+    low, upp = _base_revenue_band(review_count)
+
+    staff_count = context.get("staff_count")
+    if staff_count is None and dentist_profile:
+        ops = (dentist_profile.get("operations") or {}).get("staff_count_estimate") or {}
+        if isinstance(ops.get("value"), (int, float)):
+            staff_count = int(ops["value"])
+    if staff_count is not None:
+        try:
+            staff_count = int(staff_count)
+        except (TypeError, ValueError):
+            staff_count = None
+
+    multiple_locations = context.get("multiple_location_flag") is True
+    if not multiple_locations and dentist_profile:
+        multiple_locations = (dentist_profile.get("operations") or {}).get("multiple_locations") is True
+
+    high_ticket_emph = _high_ticket_emphasized(high_ticket)
+    low, upp = _apply_revenue_adjustments(
+        low, upp, high_ticket_emph, multiple_locations, staff_count, high_income_metro
+    )
+    # Floor: no unrealistic revenue under floor for operating dentist
+    low = max(low, REVENUE_FLOOR_LOWER)
+    upp = max(upp, REVENUE_FLOOR_UPPER)
+    if low > upp:
+        upp = low
+
+    revenue_band_estimate = {
+        "lower": low,
+        "upper": upp,
+        "currency": "USD",
+        "period": "annual",
+    }
+
+    organic_revenue_gap_estimate = None
+    gap_pct_lo, gap_pct_hi = _organic_gap_percentage(missing_high_value, ads_active)
+    gap_lower = low * gap_pct_lo
+    gap_upper = upp * gap_pct_hi
+    gap_lower, gap_upper = _cap_organic_gap(gap_lower, gap_upper, upp, max_gap_pct=0.30)
+    if gap_lower > 0 or gap_upper > 0:
+        organic_revenue_gap_estimate = {
+            "lower": gap_lower,
+            "upper": gap_upper,
+            "currency": "USD",
+            "period": "annual",
+            "driver": "missing_high_value_pages" if missing_high_value else "baseline",
+        }
+
+    revenue_confidence_score = _revenue_confidence_score(
+        context,
+        dentist_profile,
+        objective_layer,
+        high_ticket_emph,
+        multiple_locations,
+        staff_count,
+        pricing_page_detected,
+    )
+
+    # Confidence gating: summary should show "Indicative only" when data is weak
+    has_website = context.get("signal_has_website") is True
+    has_services = bool(high_ticket or svc.get("general_services_detected"))
+    indicative_only = (
+        not has_website
+        or review_count < 15
+        or not has_services
+    )
+
+    return {
+        "revenue_band_estimate": revenue_band_estimate,
+        "organic_revenue_gap_estimate": organic_revenue_gap_estimate,
+        "revenue_confidence_score": revenue_confidence_score,
+        "indicative_only": indicative_only,
+        "model_version": REVENUE_MODEL_VERSION,
+    }

@@ -691,11 +691,15 @@ def compute_objective_decision_layer(
     seo_lever = _compute_seo_best_lever(root_bottleneck["bottleneck"], dcm)
     comparative_context = _compute_comparative_context(lead, competitive_snapshot)
 
-    llm_block = _llm_objective_layer(
-        lead, dentist_profile, dcm, root_bottleneck, seo_lever, comparative_context,
-        service_intelligence=service_intelligence,
-        revenue_leverage=revenue_leverage,
-    )
+    use_llm = os.getenv("USE_LLM_OBJECTIVE_LAYER", "").strip().lower() in ("1", "true", "yes")
+    if use_llm:
+        llm_block = _llm_objective_layer(
+            lead, dentist_profile, dcm, root_bottleneck, seo_lever, comparative_context,
+            service_intelligence=service_intelligence,
+            revenue_leverage=revenue_leverage,
+        )
+    else:
+        llm_block = _fallback_objective_output(root_bottleneck, service_intelligence)
 
     seo_sales_value_score = 50
     if revenue_leverage and competitive_snapshot is not None:

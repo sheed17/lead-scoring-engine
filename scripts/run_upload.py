@@ -26,6 +26,13 @@ from typing import Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load .env from project root so META_ACCESS_TOKEN, GOOGLE_PLACES_API_KEY work without exporting
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+except ImportError:
+    pass
+
 from pipeline.upload import (
     load_uploaded_leads,
     build_synthetic_place_details,

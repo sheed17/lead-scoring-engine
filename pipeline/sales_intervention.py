@@ -252,6 +252,8 @@ def build_sales_intervention_intelligence(
     """
     if not dentist_profile_v1:
         return {}
+    if os.getenv("USE_LLM_SALES_INTERVENTION", "").strip().lower() not in ("1", "true", "yes"):
+        return {}
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         logger.warning("OPENAI_API_KEY not set; skipping sales intervention intelligence")

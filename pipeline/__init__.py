@@ -55,6 +55,7 @@ from .dentist_profile import is_dental_practice, build_dentist_profile_v1, fetch
 from .dentist_llm_reasoning import dentist_llm_reasoning_layer
 from .sales_intervention import build_sales_intervention_intelligence
 from .objective_decision_layer import compute_objective_decision_layer
+from .revenue_intelligence import build_revenue_intelligence
 
 __all__ = [
     # geo
@@ -112,4 +113,5 @@ __all__ = [
     "dentist_llm_reasoning_layer",
     "build_sales_intervention_intelligence",
     "compute_objective_decision_layer",
+    "build_revenue_intelligence",
 ]

@@ -139,6 +139,8 @@ def dentist_llm_reasoning_layer(
     """
     if not dentist_profile_v1:
         return {}
+    if os.getenv("USE_LLM_DENTIST_REASONING", "").strip().lower() not in ("1", "true", "yes"):
+        return {}
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         logger.warning("OPENAI_API_KEY not set; skipping dentist LLM reasoning layer")

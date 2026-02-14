@@ -35,6 +35,13 @@ from typing import List, Dict, Optional
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load .env from project root so META_ACCESS_TOKEN, GOOGLE_PLACES_API_KEY work without exporting
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+except ImportError:
+    pass
+
 from pipeline.enrich import PlaceDetailsEnricher
 from pipeline.signals import (
     extract_signals,
@@ -66,6 +73,11 @@ from pipeline.sales_intervention import build_sales_intervention_intelligence
 from pipeline.objective_decision_layer import compute_objective_decision_layer
 from pipeline.service_depth import build_service_intelligence
 from pipeline.competitor_sampling import fetch_competitors_nearby, build_competitive_snapshot
+from pipeline.revenue_intelligence import build_revenue_intelligence
+from pipeline.agency_decision import build_agency_decision_v1
+from pipeline.llm_structured_extraction import extract_structured
+from pipeline.llm_executive_compression import build_executive_summary_and_outreach
+from pipeline.service_depth import get_page_texts_for_llm
 
 # Configure logging
 logging.basicConfig(
@@ -462,6 +474,43 @@ def run_enrichment_pipeline(
                         service_intelligence=service_intel,
                         competitive_snapshot=competitive_snap if competitors else None,
                         revenue_leverage=None,
+                    )
+                    rev_intel = build_revenue_intelligence(
+                        merged,
+                        dentist_profile_v1,
+                        obj_layer or {},
+                        paid_intelligence=merged.get("paid_intelligence"),
+                    )
+                    merged["revenue_intelligence"] = rev_intel
+                    llm_extraction = None
+                    if os.getenv("USE_LLM_STRUCTURED_EXTRACTION", "").strip().lower() in ("1", "true", "yes"):
+                        page_texts = get_page_texts_for_llm(merged.get("signal_website_url"), website_html)
+                        llm_extraction = extract_structured(
+                            page_texts.get("homepage_text") or "",
+                            page_texts.get("services_page_text"),
+                            page_texts.get("pricing_page_text"),
+                        )
+                        merged["llm_structured_extraction"] = llm_extraction
+                    executive_summary = None
+                    outreach_angle = None
+                    if os.getenv("USE_LLM_EXECUTIVE_COMPRESSION", "").strip().lower() in ("1", "true", "yes"):
+                        root = (obj_layer or {}).get("root_bottleneck_classification") or {}
+                        comp = build_executive_summary_and_outreach(
+                            primary_constraint=root.get("why_root_cause") or root.get("bottleneck") or "",
+                            revenue_gap=rev_intel.get("organic_revenue_gap_estimate"),
+                            cost_leakage_signals=rev_intel.get("cost_leakage_signals"),
+                            service_focus=(llm_extraction or {}).get("service_focus"),
+                        )
+                        executive_summary = comp.get("executive_summary")
+                        outreach_angle = comp.get("outreach_angle")
+                    merged["agency_decision_v1"] = build_agency_decision_v1(
+                        merged,
+                        dentist_profile_v1,
+                        obj_layer or {},
+                        rev_intel,
+                        llm_extraction=llm_extraction,
+                        executive_summary=executive_summary,
+                        outreach_angle=outreach_angle,
                     )
                 else:
                     sales_intel = None

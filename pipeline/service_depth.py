@@ -102,6 +102,50 @@ def _is_service_like_path(url: str) -> bool:
     return False
 
 
+def _is_pricing_like_path(url: str) -> bool:
+    slugs = _path_slugs(url)
+    for s in ["pricing", "price", "cost", "fees", "insurance", "payment"]:
+        if s in slugs:
+            return True
+    return False
+
+
+def get_page_texts_for_llm(
+    website_url: Optional[str],
+    website_html: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
+    """
+    Return homepage_text, services_page_text, pricing_page_text for LLM structured extraction.
+    Keys: "homepage_text", "services_page_text", "pricing_page_text".
+    """
+    out = {"homepage_text": None, "services_page_text": None, "pricing_page_text": None}
+    if not (website_url or "").strip():
+        return out
+    base_url = website_url if website_url.startswith(("http://", "https://")) else "https://" + website_url
+    html = website_html or _fetch_html(base_url)
+    if not html:
+        return out
+    out["homepage_text"] = _strip_html(html)
+    links = _extract_links(html, base_url)
+    service_like = [u for u in links if _is_service_like_path(u)]
+    pricing_like = [u for u in links if _is_pricing_like_path(u)]
+    for url in service_like[:1]:
+        if url == base_url:
+            continue
+        h = _fetch_html(url)
+        if h:
+            out["services_page_text"] = _strip_html(h)
+            break
+    for url in pricing_like[:1]:
+        if url == base_url:
+            continue
+        h = _fetch_html(url)
+        if h:
+            out["pricing_page_text"] = _strip_html(h)
+            break
+    return out
+
+
 def _strip_html(html: str) -> str:
     if not html:
         return ""
