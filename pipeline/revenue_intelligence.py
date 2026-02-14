@@ -97,6 +97,7 @@ def build_revenue_intelligence(
         "organic_revenue_gap_estimate": revenue_out["organic_revenue_gap_estimate"],
         "revenue_confidence_score": revenue_out["revenue_confidence_score"],
         "revenue_indicative_only": revenue_out.get("indicative_only", False),
+        "revenue_reliability_grade": revenue_out.get("revenue_reliability_grade", "C"),
         "paid_spend_range_estimate": paid_spend_range_estimate,
         "traffic_index": traffic_out["traffic_index"],
         "traffic_estimate_tier": traffic_out["traffic_estimate_tier"],

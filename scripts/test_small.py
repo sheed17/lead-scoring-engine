@@ -21,7 +21,7 @@ Total cost: ~$0.07
 Usage:
     export GOOGLE_PLACES_API_KEY="your-api-key"
     export OPENAI_API_KEY="your-openai-key"   # optional, for review summary + dentist LLM
-    USE_LLM_NARRATOR=1 python scripts/test_small.py   # optional narrator
+    ENABLE_NARRATOR=true python scripts/test_small.py   # optional narrator
     python scripts/test_small.py
 """
 
@@ -61,6 +61,7 @@ from pipeline.service_depth import build_service_intelligence
 from pipeline.competitor_sampling import fetch_competitors_nearby, build_competitive_snapshot
 from pipeline.sixty_second_summary import build_sixty_second_summary
 from pipeline.revenue_intelligence import build_revenue_intelligence
+from pipeline.canonical_decision_model import build_canonical_summary_v1
 from pipeline.agency_decision import build_agency_decision_v1
 from pipeline.llm_structured_extraction import extract_structured
 from pipeline.llm_executive_compression import build_executive_summary_and_outreach
@@ -293,6 +294,8 @@ def run_small_test():
             revenue_leverage=None,
         )
         lead["objective_decision_layer"] = obj_layer if obj_layer else {}
+        lead["competitive_snapshot"] = competitive_snap
+        lead["service_intelligence"] = service_intel
         dentist_profile_v1 = lead.get("dentist_profile_v1") or {}
         # Optional: get page texts first so we can set pricing_page_detected for revenue confidence
         page_texts = None
@@ -315,50 +318,64 @@ def run_small_test():
                 page_texts.get("pricing_page_text"),
             )
             lead["llm_structured_extraction"] = llm_extraction
-        # Canonical output for UI
-        executive_summary = None
-        outreach_angle = None
-        if os.getenv("USE_LLM_EXECUTIVE_COMPRESSION", "").strip().lower() in ("1", "true", "yes"):
-            root = (obj_layer or {}).get("root_bottleneck_classification") or {}
-            comp = build_executive_summary_and_outreach(
-                primary_constraint=root.get("why_root_cause") or root.get("bottleneck") or "",
-                revenue_gap=rev_intel.get("organic_revenue_gap_estimate"),
-                cost_leakage_signals=rev_intel.get("cost_leakage_signals"),
-                service_focus=(llm_extraction or {}).get("service_focus"),
-            )
-            executive_summary = comp.get("executive_summary")
-            outreach_angle = comp.get("outreach_angle")
-        agency_v1 = build_agency_decision_v1(
-            lead,
-            dentist_profile_v1,
-            obj_layer or {},
+        # Layer B: single canonical decision object (frozen contract)
+        signals_layer = {k: v for k, v in lead.items() if k.startswith("signal_") or k in ("user_ratings_total", "verdict", "rating")}
+        canonical_summary_v1 = build_canonical_summary_v1(
+            signals_layer,
+            competitive_snap,
+            service_intel,
             rev_intel,
-            llm_extraction=llm_extraction,
-            executive_summary=executive_summary,
-            outreach_angle=outreach_angle,
+            obj_layer or {},
         )
-        lead["agency_decision_v1"] = agency_v1
-        # Optional LLM narrator (feature-flagged): narrative lines from canonical summary only
-        if os.getenv("USE_LLM_NARRATOR", "").strip().lower() in ("1", "true", "yes"):
-            summary_60s = (agency_v1 or {}).get("summary_60s")
-            if summary_60s:
-                narration = narrate_from_canonical(summary_60s)
-                if narration:
-                    agency_v1["llm_narration"] = narration
-        # Deprecated: UI consumes agency_decision_v1.summary_60s only. Old summary under debug.
-        lead.setdefault("debug", {})["sixty_second_summary"] = build_sixty_second_summary(lead)
+        lead["canonical_summary_v1"] = canonical_summary_v1
+        narrator_optional = None
+        if os.getenv("ENABLE_NARRATOR", "").strip().lower() in ("1", "true", "yes"):
+            narrator_optional = narrate_from_canonical(canonical_summary_v1)
+        lead["narrator_optional"] = narrator_optional
+        # Internal debug: not consumed by UI
+        lead["internal_debug"] = {
+            "dentist_profile_v1": dentist_profile_v1,
+            "agency_decision_v1_deprecated": build_agency_decision_v1(lead, dentist_profile_v1, obj_layer or {}, rev_intel),
+            "sixty_second_summary": build_sixty_second_summary(lead),
+            "verdict": lead.get("verdict"),
+            "confidence": lead.get("confidence"),
+            "reasoning": lead.get("reasoning"),
+            "primary_risks": lead.get("primary_risks"),
+            "what_would_change": lead.get("what_would_change"),
+            "agency_type": lead.get("agency_type"),
+            "llm_reasoning_layer": lead.get("llm_reasoning_layer"),
+            "sales_intervention_intelligence": lead.get("sales_intervention_intelligence"),
+        }
         if obj_layer and obj_layer.get("root_bottleneck_classification"):
             seo_assess = obj_layer.get("seo_lever_assessment") or {}
             logger.info(f"    Root bottleneck: %s | SEO primary lever: %s", obj_layer["root_bottleneck_classification"].get("bottleneck"), seo_assess.get("is_primary_growth_lever"))
     logger.info(f"  Dental leads with profile: {dentist_count}/{len(final_leads)}")
     
     # =========================================
-    # Step 7: Save results
+    # Step 7: Save results (frozen contract)
     # =========================================
     logger.info("\n[Step 7] Saving results...")
     
     os.makedirs(os.path.dirname(TEST_CONFIG["output_file"]), exist_ok=True)
-    
+
+    def _to_contract_lead(l):
+        """One lead: metadata, signals, models, canonical_summary_v1, narrator_optional, internal_debug."""
+        sig = {k: v for k, v in l.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating", "verdict")}
+        sig["competitive_snapshot"] = l.get("competitive_snapshot")
+        sig["service_intelligence"] = l.get("service_intelligence")
+        sig["paid_intelligence"] = l.get("paid_intelligence")
+        sig["revenue_intelligence"] = l.get("revenue_intelligence")
+        return {
+            "place_id": l.get("place_id"),
+            "name": l.get("name"),
+            "address": l.get("address"),
+            "signals": sig,
+            "models": l.get("objective_decision_layer"),
+            "canonical_summary_v1": l.get("canonical_summary_v1"),
+            "narrator_optional": l.get("narrator_optional"),
+            "internal_debug": l.get("internal_debug"),
+        }
+
     output_data = {
         "metadata": {
             "test_run": True,
@@ -376,7 +393,7 @@ def run_small_test():
             ),
             "dentist_leads_with_profile": sum(1 for l in final_leads if l.get("dentist_profile_v1")),
         },
-        "leads": final_leads
+        "leads": [_to_contract_lead(l) for l in final_leads],
     }
     
     with open(TEST_CONFIG["output_file"], 'w') as f:
@@ -397,28 +414,21 @@ def run_small_test():
     
     # Print decision summary
     if final_leads:
-        verdicts = [l.get("verdict") for l in final_leads if l.get("verdict")]
-        high = sum(1 for v in verdicts if v == "HIGH")
-        medium = sum(1 for v in verdicts if v == "MEDIUM")
-        low = sum(1 for v in verdicts if v == "LOW")
-        logger.info(f"\nDecision Summary:")
-        logger.info(f"  Verdicts: HIGH=%s MEDIUM=%s LOW=%s", high, medium, low)
-        dentist_with_profile = sum(1 for l in final_leads if l.get("dentist_profile_v1"))
+        worth = [l.get("canonical_summary_v1", {}).get("worth_pursuing") for l in final_leads]
+        yes = sum(1 for v in worth if v == "Yes")
+        maybe = sum(1 for v in worth if v == "Maybe")
+        no = sum(1 for v in worth if v == "No")
+        logger.info(f"\nDecision Summary (worth_pursuing):")
+        logger.info(f"  Yes=%s Maybe=%s No=%s", yes, maybe, no)
+        dentist_with_profile = sum(1 for l in final_leads if (l.get("internal_debug") or {}).get("dentist_profile_v1"))
         logger.info(f"  Dentist profile: %s/%s leads", dentist_with_profile, len(final_leads))
     
-    # Print one full example (decision-first; include dentist_profile_v1 / llm_reasoning_layer if present)
+    # Print one full example (contract shape)
     if final_leads:
         logger.info("\n" + "-" * 60)
-        logger.info("SAMPLE OUTPUT (first lead):")
+        logger.info("SAMPLE OUTPUT (first lead — contract)")
         logger.info("-" * 60)
-        sample = {k: v for k, v in final_leads[0].items()
-                  if k in (
-                      "place_id", "name", "address",
-                      "verdict", "confidence", "reasoning",
-                      "primary_risks", "what_would_change", "agency_type",
-                      "dentist_profile_v1", "llm_reasoning_layer", "sales_intervention_intelligence", "objective_decision_layer",
-                      "agency_decision_v1", "revenue_intelligence",
-                  ) or k.startswith("signal_")}
+        sample = output_data["leads"][0]
         print(json.dumps(sample, indent=2, default=str))
     
     return final_leads

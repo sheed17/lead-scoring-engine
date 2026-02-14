@@ -213,10 +213,21 @@ def compute_revenue_v2(
         or not has_services
     )
 
+    # revenue_reliability_grade: A = GA4/direct (we have none), B = strong proxy + competitor context, C = weak proxy only
+    competitive_snapshot = (objective_layer or {}).get("competitive_snapshot") or {}
+    has_competitor_context = (competitive_snapshot.get("dentists_sampled") or 0) >= 3
+    if has_website and review_count >= 30 and has_services and has_competitor_context:
+        revenue_reliability_grade = "B"
+    elif has_website and (review_count >= 15 or has_services):
+        revenue_reliability_grade = "B"
+    else:
+        revenue_reliability_grade = "C"
+
     return {
         "revenue_band_estimate": revenue_band_estimate,
         "organic_revenue_gap_estimate": organic_revenue_gap_estimate,
         "revenue_confidence_score": revenue_confidence_score,
         "indicative_only": indicative_only,
+        "revenue_reliability_grade": revenue_reliability_grade,
         "model_version": REVENUE_MODEL_VERSION,
     }

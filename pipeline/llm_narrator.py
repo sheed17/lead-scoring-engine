@@ -1,9 +1,8 @@
 """
-Optional LLM narrator: narrative compression from canonical summary_60s only.
-Contract: summary_60s is the ONLY source. No raw lead fields, no HTML, no external scraping.
-Input: canonical summary_60s. Output: strict JSON (1–2 sentences each).
-Temperature <= 0.2, small max tokens. Hard no-hallucination: reject unknown numbers and DISALLOWED_PHRASES.
-UI works without this; feature-flagged.
+Optional LLM narrator: compresses canonical_summary_v1 into 3 lines only.
+Contract: Input is ONLY canonical_summary_v1. No raw lead, no HTML, no new numbers/tiers/fields.
+Output: executive_summary_1liner, outreach_angle_1liner, objections_1liner. JSON only; numbers must exist in input.
+Feature flag: ENABLE_NARRATOR=true. If disabled, UI works normally.
 """
 
 import os
@@ -43,10 +42,10 @@ def _extract_numbers_from_text(text: str) -> set:
     return numbers
 
 
-def _numbers_in_canonical(summary_60s: Dict) -> set:
-    """Collect all numeric values present in the canonical summary (allowed in LLM output)."""
+def _numbers_in_canonical(canonical_summary_v1: Dict) -> set:
+    """Collect all numeric values present in canonical_summary_v1 (allowed in LLM output)."""
     allowed = set()
-    if not summary_60s:
+    if not canonical_summary_v1:
         return allowed
 
     def collect(d: Any) -> None:
@@ -65,7 +64,7 @@ def _numbers_in_canonical(summary_60s: Dict) -> set:
             except ValueError:
                 pass
 
-    collect(summary_60s)
+    collect(canonical_summary_v1)
     return allowed
 
 
@@ -97,56 +96,45 @@ def _validate_narrator_output(parsed: Dict, allowed_numbers: set) -> bool:
 
 
 def narrate_from_canonical(
-    summary_60s: Dict[str, Any],
+    canonical_summary_v1: Dict[str, Any],
     temperature: float = 0.2,
     max_tokens: int = 300,
 ) -> Optional[Dict[str, Any]]:
     """
-    Optional LLM: compress canonical summary into 1–2 sentence lines.
-    Input: ONLY canonical summary_60s (no raw lead, no HTML, no scraping). Output: executive_summary_1liner, outreach_angle_1liner, objections_1liner.
-    Returns None if disabled, no API key, or validation fails. Does not block pipeline.
+    Optional LLM: compress canonical_summary_v1 into 3 lines. No numbers/tiers/signals invented.
+    Input: ONLY canonical_summary_v1. Output: executive_summary_1liner, outreach_angle_1liner, objections_1liner.
+    Returns None if ENABLE_NARRATOR not set, no API key, or validation fails. Does not block pipeline.
     """
+    if os.getenv("ENABLE_NARRATOR", "").strip().lower() not in ("1", "true", "yes"):
+        return None
     if not os.getenv("OPENAI_API_KEY"):
         return None
     if temperature > 0.2:
         temperature = 0.2
 
-    # Build prompt from canonical summary_60s only (no raw lead, no HTML, no scraping)
+    # Build prompt from canonical_summary_v1 only (no raw lead, no HTML)
+    s = canonical_summary_v1 or {}
     parts = []
-    parts.append(f"Worth pursuing: {summary_60s.get('worth_pursuing')} - {summary_60s.get('worth_pursuing_reason', '')[:100]}")
-    parts.append(f"Root constraint: {summary_60s.get('root_constraint')}")
-    parts.append(f"Right lever: {summary_60s.get('right_lever_summary', '')[:80]}")
-    parts.append(f"Market: {summary_60s.get('market_position_one_line', '')[:80]}")
-    parts.append(f"Confidence: {summary_60s.get('confidence_summary')}")
-    cost_leakage = summary_60s.get("cost_leakage_signals") or []
-    if cost_leakage:
-        parts.append("Leakage: " + "; ".join(cost_leakage[:3]))
-
-    # Traffic narrator integration: explicit traffic numbers so LLM may reference but not invent
-    traffic_est = summary_60s.get("traffic_estimate") or {}
-    monthly = traffic_est.get("traffic_estimate_monthly") or {}
-    lo = monthly.get("lower")
-    hi = monthly.get("upper")
-    conf = monthly.get("confidence")
+    parts.append(f"Worth pursuing: {s.get('worth_pursuing')} - {(s.get('worth_pursuing_reason') or '')[:100]}")
+    parts.append(f"Root constraint: {s.get('root_constraint')}")
+    parts.append(f"Right lever: {(s.get('right_lever_summary') or '')[:80]}")
+    parts.append(f"Market: {(s.get('market_position_one_line') or '')[:80]}")
+    parts.append(f"Confidence: {s.get('confidence_summary')}")
+    monthly = s.get("traffic_estimate_monthly") or {}
+    lo, hi = monthly.get("lower"), monthly.get("upper")
     if lo is not None and hi is not None:
-        parts.append(f"Traffic: {lo}-{hi} visits/month (confidence {conf})")
-    paid_clicks = traffic_est.get("paid_clicks_estimate_monthly")
-    if paid_clicks and isinstance(paid_clicks, dict):
-        plo = paid_clicks.get("lower")
-        phi = paid_clicks.get("upper")
+        parts.append(f"Traffic: {lo}-{hi} visits/month")
+    paid = s.get("paid_clicks_estimate_monthly")
+    if paid and isinstance(paid, dict):
+        plo, phi = paid.get("lower"), paid.get("upper")
         if plo is not None and phi is not None:
             parts.append(f"Paid: {plo}-{phi} clicks/month")
-    eff = traffic_est.get("traffic_efficiency_interpretation")
-    if eff:
-        parts.append(f"Efficiency: {eff}")
-    traffic_conf = traffic_est.get("traffic_confidence_score")
-    if traffic_conf is not None:
-        parts.append(f"Traffic confidence: {traffic_conf}")
+    eff = s.get("traffic_efficiency_score")
+    if eff is not None:
+        parts.append(f"Traffic efficiency score: {eff}")
 
     prompt_text = "\n".join(parts)[:1000]
-
-    # Whitelist: only numbers present in canonical summary (LLM may reference, may not generate new)
-    allowed_numbers = _numbers_in_canonical(summary_60s)
+    allowed_numbers = _numbers_in_canonical(canonical_summary_v1)
 
     try:
         from openai import OpenAI
