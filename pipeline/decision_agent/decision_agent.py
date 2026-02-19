@@ -58,6 +58,44 @@ def _build_system_message(agency_type: Literal["seo", "marketing"]) -> str:
         )
 
 
+def _build_system_message_objective(agency_type: Literal["seo", "marketing"]) -> str:
+    """System prompt when judging precomputed objective_intelligence: strategic verdict only."""
+    base = (
+        "You are judging the objective_intelligence already computed for this lead. "
+        "Do not restate raw signals. Do not invent numbers. "
+        "Give a strategic verdict (HIGH, MEDIUM, or LOW), confidence, reasoning, primary_risks, what_would_change. "
+        "Output only valid JSON."
+    )
+    if agency_type == "seo":
+        return (
+            "You are a senior SEO agency operator. " + base
+            + " Focus on whether this practice is worth pursuing for SEO (local visibility, service pages, schema, GBP)."
+        )
+    return (
+        "You are a senior marketing agency operator. " + base
+        + " Focus on whether this practice is worth pursuing for marketing."
+    )
+
+
+def _build_user_message_objective(objective_intelligence_summary: str, lead_name: str = "", agency_type: str = "marketing") -> str:
+    """User message when input is the precomputed objective_intelligence summary (bullets)."""
+    name_line = f"Business: {lead_name}\n\n" if lead_name else ""
+    return f"""{name_line}Objective intelligence (already computed):
+
+{objective_intelligence_summary}
+
+Agency type: {agency_type}
+
+Return a JSON object with exactly these keys (no other text):
+- "verdict": exactly one of "HIGH", "MEDIUM", "LOW"
+- "confidence": number between 0.0 and 1.0
+- "reasoning": one short paragraph with your strategic judgment (do not restate the bullets; do not invent numbers)
+- "primary_risks": array of 1-3 short risk strings
+- "what_would_change": array of 1-3 short strings describing what would change your decision
+
+Output only the JSON object."""
+
+
 def _format_signals_for_prompt(semantic: Dict[str, str]) -> str:
     lines = [f"- {k}: {v}" for k, v in semantic.items()]
     return "\n".join(lines) if lines else "No signals."
@@ -174,6 +212,55 @@ class DecisionAgent:
 
         system = _build_system_message(self.agency_type)
         user = _build_user_message(normalized_signals, lead_name)
+
+        try:
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.3,
+                timeout=REQUEST_TIMEOUT,
+            )
+            choice = response.choices[0] if response.choices else None
+            if not choice or not getattr(choice, "message", None):
+                return _fallback_decision()
+            text = (choice.message.content or "").strip()
+            decision = _parse_response(text)
+            if decision is None:
+                logger.warning("Decision parse failed; raw response: %s", text[:500])
+                return _fallback_decision()
+            return decision
+        except Exception as e:
+            logger.warning("DecisionAgent LLM request failed: %s", e)
+            return _fallback_decision()
+
+    def decide_from_objective_summary(
+        self,
+        objective_intelligence_summary: str,
+        lead_name: str = "",
+    ) -> Decision:
+        """
+        Run one decision from precomputed objective_intelligence summary (bullets).
+        Use this when the pipeline has already built objective_intelligence; the agent
+        judges that summary only and does not restate raw data or invent numbers.
+        """
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logger.warning("OPENAI_API_KEY not set; returning fallback decision")
+            return _fallback_decision()
+        client = _get_client()
+        if not client:
+            logger.warning("openai package not installed; returning fallback decision")
+            return _fallback_decision()
+
+        system = _build_system_message_objective(self.agency_type)
+        user = _build_user_message_objective(
+            objective_intelligence_summary or "No summary.",
+            lead_name=lead_name,
+            agency_type=self.agency_type,
+        )
 
         try:
             response = client.chat.completions.create(

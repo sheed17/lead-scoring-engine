@@ -22,6 +22,22 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Ensure .env is loaded from project root when reading token (so updated token is used)
+_dotenv_loaded = False
+
+
+def _ensure_dotenv_loaded() -> None:
+    global _dotenv_loaded
+    if _dotenv_loaded:
+        return
+    try:
+        from dotenv import load_dotenv
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        load_dotenv(os.path.join(root, ".env"), override=True)
+        _dotenv_loaded = True
+    except ImportError:
+        _dotenv_loaded = True  # no dotenv; avoid retry
+
 # Meta Graph API
 META_ADS_ARCHIVE_URL = "https://graph.facebook.com/v21.0/ads_archive"
 
@@ -36,7 +52,8 @@ REQUEST_TIMEOUT = 15
 
 
 def get_meta_access_token() -> Optional[str]:
-    """Get Meta access token from environment (stripped of whitespace)."""
+    """Get Meta access token from environment (stripped of whitespace). Loads .env from project root so an updated token is used."""
+    _ensure_dotenv_loaded()
     raw = os.getenv("META_ACCESS_TOKEN")
     return raw.strip() if raw else None
 

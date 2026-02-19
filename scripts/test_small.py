@@ -59,6 +59,7 @@ from pipeline.sales_intervention import build_sales_intervention_intelligence
 from pipeline.objective_decision_layer import compute_objective_decision_layer
 from pipeline.service_depth import build_service_intelligence
 from pipeline.competitor_sampling import fetch_competitors_nearby, build_competitive_snapshot
+from pipeline.objective_intelligence import build_objective_intelligence, build_objective_intelligence_summary
 from pipeline.sixty_second_summary import build_sixty_second_summary
 from pipeline.revenue_intelligence import build_revenue_intelligence
 from pipeline.canonical_decision_model import build_canonical_summary_v1
@@ -208,24 +209,35 @@ def run_small_test():
                 logger.info(f"    📢 Meta Ads: checked — none in library for US")
     
     # =========================================
-    # Step 5: Decision Agent (verdict + reasoning; no embeddings in v1)
+    # Step 5: Decision Agent for non-dental leads (semantic signals); dental leads get decision after objective_intelligence in Step 6
     # =========================================
     agency_type = os.getenv("AGENCY_TYPE", "marketing").lower() or "marketing"
     if agency_type not in ("seo", "marketing"):
         agency_type = "marketing"
-    logger.info("\n[Step 5] Decision Agent (agency_type=%s)...", agency_type)
+    logger.info("\n[Step 5] Decision Agent for non-dental leads (agency_type=%s)...", agency_type)
     agent = DecisionAgent(agency_type=agency_type)
-    
-    for lead in final_leads:
-        semantic = build_semantic_signals(lead)
-        decision = agent.decide(semantic, lead_name=lead.get("name") or "")
+
+    def _store_decision(lead: dict, decision, atype: str) -> None:
+        lead["decision_agent_v1"] = {
+            "verdict": decision.verdict,
+            "confidence": decision.confidence,
+            "reasoning": decision.reasoning,
+            "primary_risks": decision.primary_risks,
+            "what_would_change": decision.what_would_change,
+        }
         lead["verdict"] = decision.verdict
         lead["confidence"] = decision.confidence
         lead["reasoning"] = decision.reasoning
         lead["primary_risks"] = decision.primary_risks
         lead["what_would_change"] = decision.what_would_change
-        lead["agency_type"] = agency_type
-        
+        lead["agency_type"] = atype
+
+    for lead in final_leads:
+        if is_dental_practice(lead):
+            continue
+        semantic = build_semantic_signals(lead)
+        decision = agent.decide(semantic, lead_name=lead.get("name") or "")
+        _store_decision(lead, decision, agency_type)
         logger.info(f"  ✓ {lead['name'][:40]}")
         logger.info(f"    Verdict: {decision.verdict} | Confidence: {decision.confidence}")
         r = decision.reasoning
@@ -249,6 +261,44 @@ def run_small_test():
         dentist_profile_v1 = build_dentist_profile_v1(lead, website_html=website_html)
         lead["dentist_profile_v1"] = dentist_profile_v1
         context = build_context(lead) if dentist_profile_v1 else {}
+        # Competitors -> Objective decision layer -> Revenue intelligence -> Objective intelligence -> Decision Agent
+        procedure_mentions = (dentist_profile_v1.get("review_intent_analysis") or {}).get("procedure_mentions") or []
+        service_intel = build_service_intelligence(lead.get("signal_website_url"), website_html, procedure_mentions)
+        competitors = []
+        search_radius_used_miles = 2
+        lat, lng = lead.get("latitude"), lead.get("longitude")
+        if lat is not None and lng is not None:
+            competitors, search_radius_used_miles = fetch_competitors_nearby(lat, lng, lead.get("place_id"))
+        competitive_snap = build_competitive_snapshot(lead, competitors, search_radius_used_miles) if competitors else {}
+        obj_layer = compute_objective_decision_layer(
+            lead,
+            service_intelligence=service_intel,
+            competitive_snapshot=competitive_snap if competitors else None,
+            revenue_leverage=None,
+        )
+        lead["objective_decision_layer"] = obj_layer if obj_layer else {}
+        lead["competitive_snapshot"] = competitive_snap
+        lead["service_intelligence"] = service_intel
+        dentist_profile_v1 = lead.get("dentist_profile_v1") or {}
+        page_texts = None
+        if os.getenv("USE_LLM_STRUCTURED_EXTRACTION", "").strip().lower() in ("1", "true", "yes"):
+            page_texts = get_page_texts_for_llm(lead.get("signal_website_url"), website_html)
+        pricing_page_detected = bool(page_texts and page_texts.get("pricing_page_text"))
+        rev_intel = build_revenue_intelligence(
+            lead,
+            dentist_profile_v1,
+            obj_layer or {},
+            pricing_page_detected=pricing_page_detected,
+            paid_intelligence=lead.get("paid_intelligence"),
+        )
+        lead["revenue_intelligence"] = rev_intel
+        # Objective intelligence (deterministic) -> Decision Agent (strategic verdict only)
+        oi = build_objective_intelligence(lead)
+        lead["objective_intelligence"] = oi
+        oi_summary = build_objective_intelligence_summary(oi)
+        decision = agent.decide_from_objective_summary(oi_summary, lead_name=lead.get("name") or "")
+        _store_decision(lead, decision, agency_type)
+        # LLM reasoning and sales intervention (use verdict/confidence from Decision Agent)
         llm_layer = {}
         if dentist_profile_v1:
             lead_score = round((lead.get("confidence") or 0) * 100)
@@ -261,7 +311,6 @@ def run_small_test():
                 confidence=lead.get("confidence"),
             )
         lead["llm_reasoning_layer"] = llm_layer if llm_layer else {}
-        # Sales & Intervention Intelligence (conversation anchor, intervention plan, access, objections, GTM)
         sales_intel = build_sales_intervention_intelligence(
             business_snapshot=lead,
             dentist_profile_v1=dentist_profile_v1,
@@ -275,41 +324,14 @@ def run_small_test():
         if dentist_profile_v1:
             af = dentist_profile_v1.get("agency_fit_reasoning", {})
             logger.info(f"    ideal_for_seo_outreach=%s | LTV=%s", af.get("ideal_for_seo_outreach"), dentist_profile_v1.get("dental_practice_profile", {}).get("estimated_ltv_class"))
+        logger.info(f"    Verdict: %s | Confidence: %s", lead.get("verdict"), lead.get("confidence"))
         if llm_layer and llm_layer.get("executive_summary"):
             logger.info(f"    LLM summary: %s", (llm_layer["executive_summary"][:80] + "...") if len(llm_layer["executive_summary"]) > 80 else llm_layer["executive_summary"])
         if sales_intel and sales_intel.get("primary_sales_anchor", {}).get("issue"):
             logger.info(f"    Primary anchor: %s", (sales_intel["primary_sales_anchor"]["issue"][:60] + "...") if len(sales_intel["primary_sales_anchor"]["issue"]) > 60 else sales_intel["primary_sales_anchor"]["issue"])
-        # Service depth (homepage + nav), competitor sampling (1.5 mi), then objective decision layer
-        procedure_mentions = (dentist_profile_v1.get("review_intent_analysis") or {}).get("procedure_mentions") or []
-        service_intel = build_service_intelligence(lead.get("signal_website_url"), website_html, procedure_mentions)
-        competitors = []
-        lat, lng = lead.get("latitude"), lead.get("longitude")
-        if lat is not None and lng is not None:
-            competitors = fetch_competitors_nearby(lat, lng, lead.get("place_id"))
-        competitive_snap = build_competitive_snapshot(lead, competitors) if competitors else {}
-        obj_layer = compute_objective_decision_layer(
-            lead,
-            service_intelligence=service_intel,
-            competitive_snapshot=competitive_snap if competitors else None,
-            revenue_leverage=None,
-        )
-        lead["objective_decision_layer"] = obj_layer if obj_layer else {}
-        lead["competitive_snapshot"] = competitive_snap
-        lead["service_intelligence"] = service_intel
-        dentist_profile_v1 = lead.get("dentist_profile_v1") or {}
-        # Optional: get page texts first so we can set pricing_page_detected for revenue confidence
-        page_texts = None
-        if os.getenv("USE_LLM_STRUCTURED_EXTRACTION", "").strip().lower() in ("1", "true", "yes"):
-            page_texts = get_page_texts_for_llm(lead.get("signal_website_url"), website_html)
-        pricing_page_detected = bool(page_texts and page_texts.get("pricing_page_text"))
-        rev_intel = build_revenue_intelligence(
-            lead,
-            dentist_profile_v1,
-            obj_layer or {},
-            pricing_page_detected=pricing_page_detected,
-            paid_intelligence=lead.get("paid_intelligence"),
-        )
-        lead["revenue_intelligence"] = rev_intel
+        if obj_layer and obj_layer.get("root_bottleneck_classification"):
+            seo_assess = obj_layer.get("seo_lever_assessment") or {}
+            logger.info(f"    Root bottleneck: %s | SEO primary lever: %s", obj_layer["root_bottleneck_classification"].get("bottleneck"), seo_assess.get("is_primary_growth_lever"))
         llm_extraction = None
         if page_texts is not None:
             llm_extraction = extract_structured(
@@ -346,9 +368,6 @@ def run_small_test():
             "llm_reasoning_layer": lead.get("llm_reasoning_layer"),
             "sales_intervention_intelligence": lead.get("sales_intervention_intelligence"),
         }
-        if obj_layer and obj_layer.get("root_bottleneck_classification"):
-            seo_assess = obj_layer.get("seo_lever_assessment") or {}
-            logger.info(f"    Root bottleneck: %s | SEO primary lever: %s", obj_layer["root_bottleneck_classification"].get("bottleneck"), seo_assess.get("is_primary_growth_lever"))
     logger.info(f"  Dental leads with profile: {dentist_count}/{len(final_leads)}")
     
     # =========================================
@@ -359,7 +378,7 @@ def run_small_test():
     os.makedirs(os.path.dirname(TEST_CONFIG["output_file"]), exist_ok=True)
 
     def _to_contract_lead(l):
-        """One lead: metadata, signals, models, canonical_summary_v1, narrator_optional, internal_debug."""
+        """One lead: metadata, signals, models, objective_intelligence, decision_agent_v1, canonical_summary_v1, narrator_optional, internal_debug."""
         sig = {k: v for k, v in l.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating", "verdict")}
         sig["competitive_snapshot"] = l.get("competitive_snapshot")
         sig["service_intelligence"] = l.get("service_intelligence")
@@ -371,6 +390,8 @@ def run_small_test():
             "address": l.get("address"),
             "signals": sig,
             "models": l.get("objective_decision_layer"),
+            "objective_intelligence": l.get("objective_intelligence"),
+            "decision_agent_v1": l.get("decision_agent_v1"),
             "canonical_summary_v1": l.get("canonical_summary_v1"),
             "narrator_optional": l.get("narrator_optional"),
             "internal_debug": l.get("internal_debug"),

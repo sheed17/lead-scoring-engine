@@ -51,6 +51,10 @@ from pipeline.signals import (
 from pipeline.meta_ads import get_meta_access_token, augment_lead_with_meta_ads
 from pipeline.semantic_signals import build_semantic_signals
 from pipeline.decision_agent import DecisionAgent
+from pipeline.objective_intelligence import (
+    build_objective_intelligence,
+    build_objective_intelligence_summary,
+)
 from pipeline.db import (
     init_db,
     create_run,
@@ -136,6 +140,24 @@ def _compute_run_stats(signals: List[Dict]) -> Dict:
     counts["total"] = total
     counts["signal_coverage_pct"] = round(100 * known / total, 1) if total else 0
     return counts
+
+
+def _store_decision(lead: Dict, decision, agency_type: str) -> None:
+    """Write Decision Agent output to lead: decision_agent_v1 and top-level fields."""
+    lead["decision_agent_v1"] = {
+        "verdict": decision.verdict,
+        "confidence": decision.confidence,
+        "reasoning": decision.reasoning,
+        "primary_risks": decision.primary_risks or [],
+        "what_would_change": decision.what_would_change or [],
+        "agency_type": agency_type,
+    }
+    lead["verdict"] = decision.verdict
+    lead["confidence"] = decision.confidence
+    lead["reasoning"] = decision.reasoning
+    lead["primary_risks"] = decision.primary_risks or []
+    lead["what_would_change"] = decision.what_would_change or []
+    lead["agency_type"] = agency_type
 
 
 def load_place_ids(filepath: str) -> List[str]:
@@ -422,66 +444,82 @@ def run_enrichment_pipeline(
                 augment_lead_with_meta_ads(merged)
             lead_id = insert_lead(run_id, merged)
             insert_lead_signals(lead_id, signal)
-            semantic = build_semantic_signals(merged)
-            decision = agent.decide(semantic, lead_name=lead.get("name") or "")
-            insert_decision(
-                lead_id=lead_id,
-                agency_type=agency_type,
-                signals_snapshot=semantic,
-                verdict=decision.verdict,
-                confidence=decision.confidence,
-                reasoning=decision.reasoning,
-                primary_risks=decision.primary_risks,
-                what_would_change=decision.what_would_change,
-                prompt_version=agent.prompt_version,
-            )
-            # Dentist vertical: profile + LLM reasoning (read-only) for dental practices only
+
             if is_dental_practice(merged):
+                # Dental: Competitors -> Objective decision layer -> Revenue intel -> Objective intelligence -> Decision Agent
                 url = merged.get("signal_website_url")
                 website_html = fetch_website_html_for_trust(url) if url else None
                 dentist_profile_v1 = build_dentist_profile_v1(merged, website_html=website_html)
+                obj_layer = None
                 llm_reasoning_layer = {}
+                sales_intel = None
                 if dentist_profile_v1:
-                    context = build_context(merged)
-                    lead_score = round(decision.confidence * 100) if decision.confidence is not None else None
-                    llm_reasoning_layer = dentist_llm_reasoning_layer(
-                        business_snapshot=merged,
-                        dentist_profile_v1=dentist_profile_v1,
-                        context_dimensions=context.get("context_dimensions", []),
-                        lead_score=lead_score,
-                        priority=decision.verdict,
-                        confidence=decision.confidence,
-                    )
-                    sales_intel = build_sales_intervention_intelligence(
-                        business_snapshot=merged,
-                        dentist_profile_v1=dentist_profile_v1,
-                        context_dimensions=context.get("context_dimensions", []),
-                        verdict=decision.verdict,
-                        confidence=decision.confidence,
-                        llm_reasoning_layer=llm_reasoning_layer,
-                    )
-                    # Service depth + competitor sampling + objective decision layer
                     merged["dentist_profile_v1"] = dentist_profile_v1
                     procedure_mentions = (dentist_profile_v1.get("review_intent_analysis") or {}).get("procedure_mentions") or []
                     service_intel = build_service_intelligence(url, website_html, procedure_mentions)
                     competitors = []
+                    search_radius_used_miles = 2
                     lat, lng = merged.get("latitude"), merged.get("longitude")
                     if lat is not None and lng is not None:
-                        competitors = fetch_competitors_nearby(lat, lng, merged.get("place_id"))
-                    competitive_snap = build_competitive_snapshot(merged, competitors) if competitors else {}
+                        competitors, search_radius_used_miles = fetch_competitors_nearby(lat, lng, merged.get("place_id"))
+                    competitive_snap = build_competitive_snapshot(merged, competitors, search_radius_used_miles) if competitors else {}
+                    merged["competitive_snapshot"] = competitive_snap
+                    merged["service_intelligence"] = service_intel
                     obj_layer = compute_objective_decision_layer(
                         merged,
                         service_intelligence=service_intel,
                         competitive_snapshot=competitive_snap if competitors else None,
                         revenue_leverage=None,
                     )
+                    merged["objective_decision_layer"] = obj_layer if obj_layer else {}
+                    pricing_page_detected = False
+                    if os.getenv("USE_LLM_STRUCTURED_EXTRACTION", "").strip().lower() in ("1", "true", "yes"):
+                        page_texts = get_page_texts_for_llm(merged.get("signal_website_url"), website_html)
+                        pricing_page_detected = bool(page_texts and page_texts.get("pricing_page_text"))
                     rev_intel = build_revenue_intelligence(
                         merged,
                         dentist_profile_v1,
                         obj_layer or {},
+                        pricing_page_detected=pricing_page_detected,
                         paid_intelligence=merged.get("paid_intelligence"),
                     )
                     merged["revenue_intelligence"] = rev_intel
+                # Objective intelligence (deterministic) -> Decision Agent (all dental leads)
+                oi = build_objective_intelligence(merged)
+                merged["objective_intelligence"] = oi
+                oi_summary = build_objective_intelligence_summary(oi)
+                decision = agent.decide_from_objective_summary(oi_summary, lead_name=merged.get("name") or "")
+                _store_decision(merged, decision, agency_type)
+                insert_decision(
+                    lead_id=lead_id,
+                    agency_type=agency_type,
+                    signals_snapshot={"objective_intelligence_summary": oi_summary},
+                    verdict=decision.verdict,
+                    confidence=decision.confidence,
+                    reasoning=decision.reasoning,
+                    primary_risks=decision.primary_risks,
+                    what_would_change=decision.what_would_change,
+                    prompt_version=agent.prompt_version,
+                )
+                if dentist_profile_v1:
+                    context = build_context(merged)
+                    lead_score = round((merged.get("confidence") or 0) * 100)
+                    llm_reasoning_layer = dentist_llm_reasoning_layer(
+                        business_snapshot=merged,
+                        dentist_profile_v1=dentist_profile_v1,
+                        context_dimensions=context.get("context_dimensions", []),
+                        lead_score=lead_score,
+                        priority=merged.get("verdict"),
+                        confidence=merged.get("confidence"),
+                    )
+                    sales_intel = build_sales_intervention_intelligence(
+                        business_snapshot=merged,
+                        dentist_profile_v1=dentist_profile_v1,
+                        context_dimensions=context.get("context_dimensions", []),
+                        verdict=merged.get("verdict"),
+                        confidence=merged.get("confidence"),
+                        llm_reasoning_layer=llm_reasoning_layer,
+                    )
                     llm_extraction = None
                     if os.getenv("USE_LLM_STRUCTURED_EXTRACTION", "").strip().lower() in ("1", "true", "yes"):
                         page_texts = get_page_texts_for_llm(merged.get("signal_website_url"), website_html)
@@ -493,13 +531,14 @@ def run_enrichment_pipeline(
                         merged["llm_structured_extraction"] = llm_extraction
                     executive_summary = None
                     outreach_angle = None
+                    rev_intel = merged.get("revenue_intelligence") or {}
                     if os.getenv("USE_LLM_EXECUTIVE_COMPRESSION", "").strip().lower() in ("1", "true", "yes"):
                         root = (obj_layer or {}).get("root_bottleneck_classification") or {}
                         comp = build_executive_summary_and_outreach(
                             primary_constraint=root.get("why_root_cause") or root.get("bottleneck") or "",
                             revenue_gap=rev_intel.get("organic_revenue_gap_estimate"),
                             cost_leakage_signals=rev_intel.get("cost_leakage_signals"),
-                            service_focus=(llm_extraction or {}).get("service_focus"),
+                            service_focus=(merged.get("llm_structured_extraction") or {}).get("service_focus"),
                         )
                         executive_summary = comp.get("executive_summary")
                         outreach_angle = comp.get("outreach_angle")
@@ -512,9 +551,6 @@ def run_enrichment_pipeline(
                         executive_summary=executive_summary,
                         outreach_angle=outreach_angle,
                     )
-                else:
-                    sales_intel = None
-                    obj_layer = None
                 update_lead_dentist_data(
                     lead_id,
                     dentist_profile_v1=dentist_profile_v1,
@@ -522,6 +558,24 @@ def run_enrichment_pipeline(
                     sales_intervention_intelligence=sales_intel if sales_intel else None,
                     objective_decision_layer=obj_layer if obj_layer else None,
                 )
+            else:
+                # Non-dental: semantic signals -> Decision Agent
+                semantic = build_semantic_signals(merged)
+                decision = agent.decide(semantic, lead_name=merged.get("name") or "")
+                _store_decision(merged, decision, agency_type)
+                insert_decision(
+                    lead_id=lead_id,
+                    agency_type=agency_type,
+                    signals_snapshot=semantic,
+                    verdict=decision.verdict,
+                    confidence=decision.confidence,
+                    reasoning=decision.reasoning,
+                    primary_risks=decision.primary_risks,
+                    what_would_change=decision.what_would_change,
+                    prompt_version=agent.prompt_version,
+                )
+
+            enriched_leads[idx] = merged
             if (idx + 1) % CONFIG["progress_interval"] == 0:
                 logger.info(f"  Decision + DB: {idx + 1}/{len(enriched_leads)} leads")
         run_stats = _compute_run_stats(signals)

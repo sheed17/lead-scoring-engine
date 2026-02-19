@@ -492,19 +492,19 @@ def _llm_objective_layer(
         "revenue_leverage": revenue_leverage,
     }
 
-    system = """You are a senior sales consultant. Output:
+    system = """You are a senior SEO agency consultant. Output:
 1) primary_sales_anchor: ONE issue mapping to the root bottleneck. Do NOT default to "booking friction" unless root_bottleneck is conversion_limited.
-2) intervention_plan: 3-5 CONCRETE actions. No vague phrases like "Develop unique service offerings". Each action must be implementable and measurable within 60 days. Examples: "Create dedicated dental implant landing page optimized for local intent"; "Build emergency dentist page targeting after-hours queries"; "Improve review acquisition for cosmetic procedures"; "Deploy conversion-tracked landing page for Invisalign paid ads". Category per item: Demand, Capture, Conversion, or Trust. First item only: "why_not_secondaries_yet" (one sentence).
+2) intervention_plan: EXACTLY 3 actions. Each must be specific and immediately usable by an SEO practitioner—deliverables they can implement (pages, schema, tracking, GBP, review flow). No vague phrases. Examples: "Create dedicated [procedure] landing page with H1/local keywords and LocalBusiness schema"; "Add MedicalBusiness/Service schema to site and submit to Search Console"; "Set up post-visit review request (email/SMS) and track review velocity"; "Add conversion goal and CTA above fold on high-value service pages"; "Optimize GBP primary category and service attributes for [procedure]". Category per item: Demand, Capture, Conversion, or Trust. First item only: "why_not_secondaries_yet" (one sentence).
 3) access_request_plan: minimal access (Google Business Profile – Manager, Website Admin, Analytics/Search Console). When to ask.
 4) de_risking_questions: exactly 3 questions. Tie to uncertainty.
-No SEO jargon. Short, verbatim-ready."""
+Short, verbatim-ready for an SEO agency."""
 
     user = f"""Respond with a single JSON object only (no markdown). Keys:
 
 - "primary_sales_anchor": {{ "issue": "...", "why_this_first": "...", "what_happens_if_ignored": "...", "confidence": 0.0 }}
   Issue MUST align with root_bottleneck={bottleneck}. No "booking friction" unless conversion_limited.
 
-- "intervention_plan": [ 3-5 items. Each: "priority", "action" (concrete, implementable, measurable in 60 days), "category" ("Demand"|"Capture"|"Conversion"|"Trust"), "expected_impact", "time_to_signal_days", "confidence". First item only: "why_not_secondaries_yet". ]
+- "intervention_plan": [ EXACTLY 3 items. Each: "priority", "action" (specific SEO deliverable—page, schema, tracking, GBP, review flow—implementable in 60 days), "category" ("Demand"|"Capture"|"Conversion"|"Trust"), "expected_impact", "time_to_signal_days", "confidence". First item only: "why_not_secondaries_yet". ]
 
 - "access_request_plan": [ 1-4 items. "intervention_ref", "access_type", "why_needed", "risk_level", "when_to_ask". ]
 
@@ -543,7 +543,7 @@ def _fallback_objective_output(
     root_bottleneck: Dict[str, Any],
     service_intelligence: Optional[Dict] = None,
 ) -> Dict[str, Any]:
-    """Deterministic fallback when LLM is unavailable. Concrete actions where possible."""
+    """Deterministic fallback when LLM is unavailable. Exactly 3 SEO-agency actions."""
     b = root_bottleneck.get("bottleneck", "visibility_limited")
     issue_map = {
         "demand_limited": "Validate demand before scaling visibility",
@@ -553,19 +553,69 @@ def _fallback_objective_output(
         "saturation_limited": "Differentiate or focus on conversion before more visibility",
         "differentiation_limited": "Build clear service or niche positioning (e.g. dedicated high-value procedure pages)",
     }
-    action_map = {
-        "demand_limited": "Validate demand and channel mix before investing in capture.",
-        "visibility_limited": "Create or optimize local service pages and improve review acquisition to capture more demand.",
-        "conversion_limited": "Add online booking or conversion-tracked landing page to capture existing traffic.",
-        "trust_limited": "Improve review acquisition and trust signals on site before scaling visibility.",
-        "saturation_limited": "Differentiate with targeted service pages or conversion focus before more visibility spend.",
-        "differentiation_limited": "Create dedicated landing page for highest-value procedure (e.g. dental implants, Invisalign) optimized for local intent.",
-    }
     missing = (service_intelligence or {}).get("missing_high_value_pages") or []
-    if missing and b in ("visibility_limited", "differentiation_limited"):
-        first = missing[0] if isinstance(missing[0], str) else str(missing[0])
-        action_map["visibility_limited"] = f"Create dedicated {first} landing page optimized for local intent."
-        action_map["differentiation_limited"] = f"Create dedicated {first} landing page optimized for local intent."
+    first_missing = (missing[0] if isinstance(missing[0], str) else str(missing[0])) if missing else "high-value procedure"
+
+    # Step 1: Primary lever (page or conversion)
+    step1_actions = {
+        "demand_limited": "Validate demand and channel mix with a simple tracking setup before investing in new pages.",
+        "visibility_limited": f"Create dedicated {first_missing} landing page with H1/local keywords and LocalBusiness schema; submit URL in Search Console.",
+        "conversion_limited": "Add conversion-tracked landing page (or online booking CTA above fold) and set a Search/GA goal for high-value procedures.",
+        "trust_limited": "Set up post-visit review request (email or SMS) and track review velocity; add trust signals (ratings, credentials) above fold on key pages.",
+        "saturation_limited": f"Create dedicated {first_missing} landing page with local intent and schema; avoid generic 'services' page—target one high-value procedure first.",
+        "differentiation_limited": f"Create dedicated {first_missing} landing page with H1/local keywords and MedicalBusiness or Service schema for local pack.",
+    }
+    step1_cat = "Trust" if b == "trust_limited" else "Capture" if b in ("visibility_limited", "differentiation_limited", "saturation_limited") else "Conversion" if b == "conversion_limited" else "Demand"
+
+    # Step 2: Schema or GBP or review flow
+    step2_actions = {
+        "demand_limited": "Add LocalBusiness (and MedicalBusiness if applicable) schema to site; verify in Search Console Rich Results.",
+        "visibility_limited": "Add MedicalBusiness or Service schema to site; verify in Search Console and fix any errors.",
+        "conversion_limited": "Add LocalBusiness schema and clear CTA (phone + booking) above fold on service pages.",
+        "trust_limited": "Add LocalBusiness and AggregateRating schema where eligible; improve GBP Q&A and service attributes.",
+        "saturation_limited": "Add schema to new and existing service pages; optimize GBP primary category and service attributes for the procedure.",
+        "differentiation_limited": "Add MedicalBusiness/Service schema to the new page and key service URLs; submit sitemap in Search Console.",
+    }
+    step2_cat = "Capture" if b in ("visibility_limited", "differentiation_limited", "saturation_limited") else "Trust" if b == "trust_limited" else "Conversion" if b == "conversion_limited" else "Demand"
+
+    # Step 3: Conversion tracking, GBP, or review velocity
+    step3_actions = {
+        "demand_limited": "Create or optimize one high-intent landing page and add a conversion goal (form submit or click) to measure demand capture.",
+        "visibility_limited": "Optimize Google Business Profile: primary category, service attributes, and one post per month; consider review request link in post-visit flow.",
+        "conversion_limited": "Optimize GBP for booking (add booking link, hours, services); optionally add review request in post-visit flow.",
+        "trust_limited": "Improve on-page trust (credentials, insurance, before/after if applicable); add conversion goal for contact/booking to measure impact.",
+        "saturation_limited": "Add conversion goal and CTA above fold on the new high-value page; optimize GBP service attributes to match.",
+        "differentiation_limited": "Add conversion tracking and clear CTA on the new page; optimize GBP primary category and one monthly post for the procedure.",
+    }
+    step3_cat = "Conversion" if b == "conversion_limited" else "Trust" if b == "trust_limited" else "Capture"
+
+    intervention_plan = [
+        {
+            "priority": 1,
+            "action": step1_actions.get(b, step1_actions["visibility_limited"]),
+            "category": step1_cat,
+            "expected_impact": "Addresses root constraint; measurable in 60 days.",
+            "time_to_signal_days": 30,
+            "confidence": 0.5,
+            "why_not_secondaries_yet": "Addressing the root bottleneck first avoids spreading effort.",
+        },
+        {
+            "priority": 2,
+            "action": step2_actions.get(b, step2_actions["visibility_limited"]),
+            "category": step2_cat,
+            "expected_impact": "Improves local pack and SERP visibility.",
+            "time_to_signal_days": 45,
+            "confidence": 0.5,
+        },
+        {
+            "priority": 3,
+            "action": step3_actions.get(b, step3_actions["visibility_limited"]),
+            "category": step3_cat,
+            "expected_impact": "Reinforces capture or conversion; measurable within 60 days.",
+            "time_to_signal_days": 45,
+            "confidence": 0.5,
+        },
+    ]
     return {
         "primary_sales_anchor": {
             "issue": issue_map.get(b, issue_map["visibility_limited"]),
@@ -573,17 +623,7 @@ def _fallback_objective_output(
             "what_happens_if_ignored": "Revenue or patient flow remains constrained.",
             "confidence": root_bottleneck.get("confidence", 0.5),
         },
-        "intervention_plan": [
-            {
-                "priority": 1,
-                "action": action_map.get(b, action_map["visibility_limited"]),
-                "category": "Trust" if b == "trust_limited" else "Capture" if b in ("visibility_limited", "differentiation_limited", "saturation_limited") else "Conversion" if b == "conversion_limited" else "Demand",
-                "expected_impact": "Directional improvement in the root constraint within 60 days.",
-                "time_to_signal_days": 30,
-                "confidence": 0.5,
-                "why_not_secondaries_yet": "Addressing the root bottleneck first avoids spreading effort.",
-            }
-        ],
+        "intervention_plan": intervention_plan,
         "access_request_plan": [
             {"intervention_ref": "Primary lever", "access_type": "Google Business Profile – Manager", "why_needed": "To implement visibility or reputation actions.", "risk_level": "Low", "when_to_ask": "After initial agreement"}
         ],
@@ -609,7 +649,7 @@ def _normalize_llm_objective(data: Dict[str, Any], root_bottleneck: Dict[str, An
         "access_request_plan": [],
         "de_risking_questions": [],
     }
-    for i, item in enumerate((data.get("intervention_plan") or [])[:5]):
+    for i, item in enumerate((data.get("intervention_plan") or [])[:3]):
         if not isinstance(item, dict):
             continue
         cat = str(item.get("category") or "Capture").strip()
