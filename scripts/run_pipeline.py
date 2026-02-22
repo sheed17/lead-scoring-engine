@@ -26,6 +26,13 @@ from typing import List, Dict, Optional
 # Add project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load .env from project root so GOOGLE_PLACES_API_KEY (and others) work without exporting
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+except ImportError:
+    pass
+
 from pipeline.geo import generate_geo_grid, estimate_api_calls
 from pipeline.fetch import PlacesFetcher, get_keywords_for_niche
 from pipeline.normalize import (
@@ -59,12 +66,12 @@ CITY_CONFIG = {
     "radius_km": 15.0  # Cover ~15km radius from downtown
 }
 
-# Search configuration
+# Search configuration (dentist vertical for SEO agency opportunity intelligence)
 SEARCH_CONFIG = {
-    "niche": "hvac",              # Business niche to search
+    "niche": "dentist",           # Business niche: dentist | dental | hvac | plumber | etc.
     "search_radius_km": 2.0,      # Radius for each grid search (km)
     "max_pages_per_query": 3,     # Max pagination depth (1-3)
-    "use_keyword_expansion": True # Use multiple keywords per niche
+    "use_keyword_expansion": True  # Use multiple keywords per niche
 }
 
 # Output configuration

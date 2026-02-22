@@ -1,36 +1,50 @@
 """
-V1 Lead Scoring System
+Prioritization Helper (Refactored from Lead Scoring V1)
 
-Rules-based scoring with confidence and explainability.
+This module provides backward-compatible scoring that wraps the
+Opportunity Intelligence system.
 
-Design Principles:
-- Conservative > clever
-- Explainable > complex
-- Unknown ≠ bad (null signals don't penalize, just reduce confidence)
-- Output must make sense to agencies
+Core Philosophy:
+- We do NOT score leads as the primary abstraction
+- Opportunities are the core intelligence output
+- Scores exist internally for sorting/filtering only
+- Priority (High/Medium/Low) is a UI affordance derived from opportunities
 
-Signal Semantics:
-- true  = confidently observed (can contribute positive points)
-- false = confidently absent (can contribute negative points or zero)
-- null  = unknown (does NOT penalize, but reduces confidence)
+Backward Compatibility:
+- score_lead() still works and returns ScoringResult
+- score_leads_batch() still works
+- All existing fields preserved
+- Now also includes opportunities in output
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 from dataclasses import dataclass
 import logging
+
+from .opportunities import (
+    analyze_opportunities,
+    OpportunityReport,
+    calculate_confidence,
+    _build_review_summary,
+    _is_true,
+    _is_false,
+    _is_known,
+    REVIEW_FRESH_DAYS,
+    REVIEW_WARM_DAYS,
+    REVIEW_STALE_DAYS,
+    LOW_REVIEW_COUNT,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (preserved from V1)
 # =============================================================================
 
-# Base score everyone starts with
 BASE_SCORE = 40
 
-# Signal weights for confidence calculation
-# Higher weight = more important for confidence
+# Signal weights for confidence (delegated to opportunities.py)
 SIGNAL_WEIGHTS = {
     "has_website": 1.0,
     "website_accessible": 1.0,
@@ -42,14 +56,6 @@ SIGNAL_WEIGHTS = {
     "last_review_days_ago": 1.0,
 }
 
-# Review freshness thresholds (in days)
-REVIEW_FRESH_DAYS = 30
-REVIEW_WARM_DAYS = 90
-REVIEW_STALE_DAYS = 180
-
-# Review volume threshold
-LOW_REVIEW_COUNT = 30
-
 
 # =============================================================================
 # DATA CLASSES
@@ -57,386 +63,160 @@ LOW_REVIEW_COUNT = 30
 
 @dataclass
 class ScoringResult:
-    """Result of lead scoring."""
-    lead_score: int           # 0-100
-    priority: str             # "High", "Medium", "Low"
+    """Result of lead analysis - backward compatible."""
+    lead_score: int           # 0-100 (internal, for sorting)
+    priority: str             # "High", "Medium", "Low" (from opportunities)
     confidence: float         # 0.0-1.0
     reasons: List[str]        # Human-readable explanations
-    review_summary: Dict      # Review context for agencies
+    review_summary: Dict      # Review context
+    opportunities: List[Dict] # NEW: opportunity intelligence (primary output)
     
     def to_dict(self) -> Dict:
-        """Convert to dictionary for JSON serialization."""
         return {
             "lead_score": self.lead_score,
             "priority": self.priority,
             "confidence": self.confidence,
             "reasons": self.reasons,
             "review_summary": self.review_summary,
+            "opportunities": self.opportunities,
         }
 
 
 # =============================================================================
-# HELPER FUNCTIONS
+# INTERNAL SCORING RULES (for sorting, NOT primary output)
 # =============================================================================
 
-def _is_known(value) -> bool:
-    """Check if a signal value is known (not null/None)."""
-    return value is not None
-
-
-def _is_true(value) -> bool:
-    """Check if a signal value is confidently true."""
-    return value is True
-
-
-def _is_false(value) -> bool:
-    """Check if a signal value is confidently false."""
-    return value is False
-
-
-def _get_priority_bucket(score: int) -> str:
-    """Determine priority bucket from score."""
-    if score >= 80:
-        return "High"
-    elif score >= 50:
-        return "Medium"
-    else:
-        return "Low"
-
-
 def _clamp(value: int, min_val: int, max_val: int) -> int:
-    """Clamp a value to a range."""
     return max(min_val, min(max_val, value))
 
 
-# =============================================================================
-# SCORING RULES
-# =============================================================================
-
-def _score_reachability(signals: Dict) -> Tuple[int, List[str]]:
+def _compute_internal_score(signals: Dict) -> Tuple[int, List[str]]:
     """
-    Score PRIMARY signals: Reachability & Intake.
+    Compute internal score for sorting/ranking purposes.
     
-    These signals indicate the business can be contacted.
-    Only positive contributions - null doesn't penalize.
+    This is NOT the primary intelligence output.
+    It exists to provide a numeric value for ordering leads.
     """
-    points = 0
+    score = BASE_SCORE
     reasons = []
     
-    # Website presence (+10)
+    # --- Reachability ---
     if _is_true(signals.get("has_website")):
-        points += 10
+        score += 10
         reasons.append("Has business website")
     
-    # Website accessible (+10)
     if _is_true(signals.get("website_accessible")):
-        points += 10
+        score += 10
         reasons.append("Website is accessible and functional")
     
-    # Phone number (+10) - PRIMARY for HVAC
     if _is_true(signals.get("has_phone")):
-        points += 10
+        score += 10
         reasons.append("Phone contact available")
     
-    # Contact form (+15) - Strong inbound signal
     if _is_true(signals.get("has_contact_form")):
-        points += 15
+        score += 15
         reasons.append("Accepts online requests via website")
     
-    # Email (+10)
     if _is_true(signals.get("has_email")):
-        points += 10
+        score += 10
         reasons.append("Email contact available")
     
-    return points, reasons
-
-
-def _score_operations_maturity(signals: Dict) -> Tuple[int, List[str]]:
-    """
-    Score OPERATIONS MATURITY (opportunity signal).
-    
-    Businesses WITHOUT automated scheduling are HIGHER opportunity
-    because they have room for optimization services.
-    
-    - false = Manual ops = +20 (high opportunity)
-    - null  = Unknown = +10 (moderate opportunity)
-    - true  = Automated = +0 (already optimized)
-    """
-    points = 0
-    reasons = []
-    
+    # --- Operations maturity ---
     scheduling = signals.get("has_automated_scheduling")
-    
     if _is_false(scheduling):
-        # Confirmed manual operations = high opportunity
-        points += 20
+        score += 20
         reasons.append("Manual scheduling detected (optimization opportunity)")
     elif scheduling is None:
-        # Unknown = moderate opportunity (don't penalize)
-        points += 10
+        score += 10
         reasons.append("Scheduling automation status unknown")
-    else:
-        # Automated = no bonus (already optimized)
-        pass
     
-    return points, reasons
-
-
-def _score_reputation_opportunity(signals: Dict) -> Tuple[int, List[str]]:
-    """
-    Score REPUTATION opportunity.
-    
-    Low review count and stale reviews indicate opportunity
-    for reputation management services.
-    """
-    points = 0
-    reasons = []
-    
+    # --- Reputation opportunity ---
     review_count = signals.get("review_count")
     last_review_days = signals.get("last_review_days_ago")
     
-    # Low review volume (+10)
     if review_count is not None and review_count < LOW_REVIEW_COUNT:
-        points += 10
+        score += 10
         reasons.append(f"Low review volume ({review_count} reviews)")
     
-    # Stale reviews (+10 or +15)
     if last_review_days is not None:
         if last_review_days > REVIEW_STALE_DAYS:
-            points += 15
+            score += 15
             months = last_review_days // 30
             reasons.append(f"No recent reviews in {months}+ months")
         elif last_review_days > REVIEW_WARM_DAYS:
-            points += 10
+            score += 10
             reasons.append("Reviews becoming stale (3+ months)")
     
-    return points, reasons
-
-
-def _score_disqualifiers(signals: Dict) -> Tuple[int, List[str]]:
-    """
-    Apply DISQUALIFIERS (rare, severe issues).
-    
-    Only applies when signals are CONFIDENTLY false.
-    Null values do NOT trigger disqualifiers.
-    """
-    points = 0
-    reasons = []
-    
-    # No contact paths at all (-40)
-    # Only if ALL are confidently false (not null)
-    has_phone = signals.get("has_phone")
-    has_form = signals.get("has_contact_form")
-    has_email = signals.get("has_email")
-    
-    if (_is_false(has_phone) and 
-        _is_false(has_form) and 
-        _is_false(has_email)):
-        points -= 40
+    # --- Disqualifiers ---
+    if (_is_false(signals.get("has_phone")) and 
+        _is_false(signals.get("has_contact_form")) and 
+        _is_false(signals.get("has_email"))):
+        score -= 40
         reasons.append("No contact methods available")
     
-    # Website inaccessible (-20)
-    # Only if website exists but is inaccessible
     if (_is_true(signals.get("has_website")) and 
         _is_false(signals.get("website_accessible"))):
-        points -= 20
+        score -= 20
         reasons.append("Website exists but is not accessible")
     
-    return points, reasons
-
-
-# =============================================================================
-# CONFIDENCE CALCULATION
-# =============================================================================
-
-def calculate_confidence(signals: Dict) -> float:
-    """
-    Calculate confidence score based on data coverage.
-    
-    Confidence = (weight of known signals) / (weight of all signals)
-    
-    Known = value is true or false
-    Unknown = value is null
-    
-    Confidence ≠ correctness
-    Confidence = how much evidence we have
-    """
-    observed_weight = 0.0
-    total_weight = 0.0
-    
-    for signal_name, weight in SIGNAL_WEIGHTS.items():
-        total_weight += weight
-        
-        # Get the signal value
-        # Handle both direct signals and signal_ prefixed versions
-        value = signals.get(signal_name)
-        if value is None:
-            value = signals.get(f"signal_{signal_name}")
-        
-        # Check if this signal is known (not null)
-        if _is_known(value):
-            observed_weight += weight
-    
-    if total_weight == 0:
-        return 0.0
-    
-    confidence = observed_weight / total_weight
-    return round(confidence, 2)
-
-
-# =============================================================================
-# REVIEW SUMMARY
-# =============================================================================
-
-def _build_review_summary(signals: Dict) -> Dict:
-    """
-    Build human-readable review summary for agency context.
-    
-    This provides at-a-glance review data alongside scoring reasons.
-    """
-    review_count = signals.get("review_count")
-    rating = signals.get("rating")
-    last_review_days = signals.get("last_review_days_ago")
-    
-    # Calculate freshness label
-    if last_review_days is None:
-        freshness = "Unknown"
-        last_review_text = "Unknown"
-    elif last_review_days <= REVIEW_FRESH_DAYS:
-        freshness = "Fresh"
-        last_review_text = f"{last_review_days} days ago"
-    elif last_review_days <= REVIEW_WARM_DAYS:
-        freshness = "Warm"
-        last_review_text = f"{last_review_days} days ago"
-    elif last_review_days <= REVIEW_STALE_DAYS:
-        freshness = "Stale"
-        months = last_review_days // 30
-        last_review_text = f"~{months} months ago"
-    else:
-        freshness = "Very Stale"
-        months = last_review_days // 30
-        last_review_text = f"~{months} months ago"
-    
-    # Volume label
-    if review_count is None:
-        volume = "Unknown"
-    elif review_count < 10:
-        volume = "Very Low"
-    elif review_count < LOW_REVIEW_COUNT:
-        volume = "Low"
-    elif review_count < 100:
-        volume = "Moderate"
-    else:
-        volume = "High"
-    
-    return {
-        "review_count": review_count,
-        "rating": rating,
-        "last_review_days_ago": last_review_days,
-        "last_review_text": last_review_text,
-        "freshness": freshness,
-        "volume": volume,
-    }
-
-
-# =============================================================================
-# MAIN SCORING FUNCTION
-# =============================================================================
-
-def score_lead(lead: Dict) -> ScoringResult:
-    """
-    Score a single lead and generate explanations.
-    
-    Args:
-        lead: Lead dictionary with signals (can have signal_ prefix or not)
-    
-    Returns:
-        ScoringResult with score, priority, confidence, and reasons
-    """
-    # Normalize signals - handle both prefixed and non-prefixed
-    signals = {}
-    for key, value in lead.items():
-        if key.startswith("signal_"):
-            clean_key = key[7:]  # Remove "signal_" prefix
-            signals[clean_key] = value
-        else:
-            signals[key] = value
-    
-    # Start with base score
-    score = BASE_SCORE
-    all_reasons = []
-    
-    # Apply scoring rules
-    reachability_points, reachability_reasons = _score_reachability(signals)
-    score += reachability_points
-    all_reasons.extend(reachability_reasons)
-    
-    ops_points, ops_reasons = _score_operations_maturity(signals)
-    score += ops_points
-    all_reasons.extend(ops_reasons)
-    
-    reputation_points, reputation_reasons = _score_reputation_opportunity(signals)
-    score += reputation_points
-    all_reasons.extend(reputation_reasons)
-    
-    disqualifier_points, disqualifier_reasons = _score_disqualifiers(signals)
-    score += disqualifier_points
-    all_reasons.extend(disqualifier_reasons)
-    
-    # Calculate confidence first (needed for adjustments)
-    confidence = calculate_confidence(signals)
-    
-    # Build review summary (needed for adjustments)
-    review_summary = _build_review_summary(signals)
-    
-    # =========================================================================
-    # SCORE REFINEMENT (make 100 rare and meaningful)
-    # =========================================================================
-    
-    raw_score = score  # Store for reference
-    
-    # --- 1. Penalties for "already optimized" businesses ---
+    # --- Penalties for "already optimized" ---
     if _is_true(signals.get("has_automated_scheduling")):
         score -= 5
-        all_reasons.append("Already uses scheduling automation (-5)")
+        reasons.append("Already uses scheduling automation (-5)")
     
     if _is_true(signals.get("has_trust_badges")):
         score -= 3
-        all_reasons.append("Has trust badges (established presence, -3)")
+        reasons.append("Has trust badges (established presence, -3)")
+    
+    # --- Paid ads bonus (budget signal) ---
+    if _is_true(signals.get("runs_paid_ads")):
+        score += 5
+        reasons.append("Running paid advertising (has budget)")
+    
+    # --- Hiring bonus (timing signal) ---
+    if _is_true(signals.get("hiring_active")):
+        score += 5
+        reasons.append("Actively hiring (growth phase)")
+    
+    return score, reasons
+
+
+def _apply_refinements(
+    score: int,
+    signals: Dict,
+    confidence: float,
+    review_summary: Dict,
+    reasons: List[str]
+) -> int:
+    """Apply score refinements (confidence dampening, caps, elite gate)."""
     
     review_count = signals.get("review_count")
     freshness = review_summary.get("freshness")
     
+    # Saturated market signal
     if freshness == "Fresh" and review_count is not None and review_count > 100:
         score -= 3
-        all_reasons.append("High volume with fresh reviews (saturated, -3)")
+        reasons.append("High volume with fresh reviews (saturated, -3)")
     
-    # --- 2. Confidence-weighted final score ---
-    # Dampens inflated scores when data is incomplete
-    # Formula: final = raw * (0.7 + 0.3 * confidence)
+    # Confidence-weighted score
     confidence_multiplier = 0.7 + 0.3 * confidence
     score = int(score * confidence_multiplier)
     
     if confidence < 0.8:
-        all_reasons.append(f"Score adjusted for data coverage ({confidence:.0%} confidence)")
+        reasons.append(f"Score adjusted for data coverage ({confidence:.0%} confidence)")
     
-    # --- 3. Review-count score ceiling ---
-    # Large brands are less ideal outreach targets
+    # Review-count ceiling
     if review_count is not None:
         if review_count > 200:
-            max_score = 92
-            if score > max_score:
-                score = max_score
-                all_reasons.append("Capped at 92 (large brand, 200+ reviews)")
+            if score > 92:
+                score = 92
+                reasons.append("Capped at 92 (large brand, 200+ reviews)")
         elif review_count > 100:
-            max_score = 95
-            if score > max_score:
-                score = max_score
-                all_reasons.append("Capped at 95 (established brand, 100+ reviews)")
+            if score > 95:
+                score = 95
+                reasons.append("Capped at 95 (established brand, 100+ reviews)")
     
-    # --- 4. Hard gate for 100-score leads ---
-    # 100 = elite, must-contact-first leads
-    # All conditions must be true for a perfect score
+    # Elite gate
     can_be_elite = (
         _is_true(signals.get("has_website")) and
         _is_true(signals.get("has_contact_form")) and
@@ -449,49 +229,73 @@ def score_lead(lead: Dict) -> ScoringResult:
     
     if score >= 100 and not can_be_elite:
         score = 95
-        all_reasons.append("Capped at 95 (does not meet elite criteria)")
+        reasons.append("Capped at 95 (does not meet elite criteria)")
     
-    # Final clamp to valid range
-    score = _clamp(score, 0, 100)
+    return _clamp(score, 0, 100)
+
+
+# =============================================================================
+# MAIN FUNCTION (backward compatible)
+# =============================================================================
+
+def score_lead(lead: Dict) -> ScoringResult:
+    """
+    Analyze a lead: extract opportunities AND compute internal score.
     
-    # Add confidence context to reasons if low
-    if confidence < 0.5:
-        all_reasons.append("Limited data available (low confidence)")
+    The primary intelligence is in the opportunities.
+    The score is for sorting/filtering only.
+    Priority is derived from opportunities, NOT the score.
+    """
+    # Normalize signals
+    signals = {}
+    for key, value in lead.items():
+        if key.startswith("signal_"):
+            signals[key[7:]] = value
+        else:
+            signals[key] = value
     
-    # Determine priority (after all adjustments)
-    priority = _get_priority_bucket(score)
+    # --- PRIMARY: Opportunity analysis ---
+    report = analyze_opportunities(lead)
+    
+    # --- SECONDARY: Internal score for sorting ---
+    raw_score, reasons = _compute_internal_score(signals)
+    
+    score = _apply_refinements(
+        raw_score, signals,
+        report.confidence, report.review_summary,
+        reasons
+    )
+    
+    # Low confidence context
+    if report.confidence < 0.5:
+        reasons.append("Limited data available (low confidence)")
     
     return ScoringResult(
         lead_score=score,
-        priority=priority,
-        confidence=confidence,
-        reasons=all_reasons,
-        review_summary=review_summary
+        priority=report.priority,  # Derived from opportunities, NOT score
+        confidence=report.confidence,
+        reasons=reasons,
+        review_summary=report.review_summary,
+        opportunities=[o.to_dict() for o in report.opportunities],
     )
 
 
 def score_leads_batch(leads: List[Dict]) -> List[Dict]:
     """
-    Score multiple leads and return enriched dictionaries.
-    
-    Args:
-        leads: List of lead dictionaries
-    
-    Returns:
-        List of leads with scoring fields added
+    Analyze multiple leads with opportunity intelligence + internal scoring.
     """
     scored_leads = []
     
     for lead in leads:
         result = score_lead(lead)
         
-        # Add scoring fields to lead
         scored_lead = lead.copy()
         scored_lead["lead_score"] = result.lead_score
         scored_lead["priority"] = result.priority
         scored_lead["confidence"] = result.confidence
         scored_lead["reasons"] = result.reasons
         scored_lead["review_summary"] = result.review_summary
+        scored_lead["opportunities"] = result.opportunities
         
         scored_leads.append(scored_lead)
     
@@ -499,44 +303,50 @@ def score_leads_batch(leads: List[Dict]) -> List[Dict]:
 
 
 def get_scoring_summary(scored_leads: List[Dict]) -> Dict:
-    """
-    Generate summary statistics for scored leads.
-    
-    Args:
-        scored_leads: List of leads with scoring fields
-    
-    Returns:
-        Summary dictionary
-    """
+    """Generate summary statistics (backward compatible)."""
     if not scored_leads:
         return {"total": 0}
     
+    total = len(scored_leads)
     scores = [l.get("lead_score", 0) for l in scored_leads]
     confidences = [l.get("confidence", 0) for l in scored_leads]
     priorities = [l.get("priority", "Unknown") for l in scored_leads]
     
-    high_priority = sum(1 for p in priorities if p == "High")
-    medium_priority = sum(1 for p in priorities if p == "Medium")
-    low_priority = sum(1 for p in priorities if p == "Low")
+    high = sum(1 for p in priorities if p == "High")
+    medium = sum(1 for p in priorities if p == "Medium")
+    low = sum(1 for p in priorities if p == "Low")
+    
+    # Opportunity type distribution
+    opp_types = {}
+    for lead in scored_leads:
+        for opp in lead.get("opportunities", []):
+            opp_type = opp.get("type", "Unknown")
+            opp_types[opp_type] = opp_types.get(opp_type, 0) + 1
+    
+    opp_counts = [len(l.get("opportunities", [])) for l in scored_leads]
     
     return {
-        "total_leads": len(scored_leads),
+        "total_leads": total,
         "score": {
-            "avg": round(sum(scores) / len(scores), 1),
+            "avg": round(sum(scores) / total, 1),
             "min": min(scores),
             "max": max(scores),
         },
         "confidence": {
-            "avg": round(sum(confidences) / len(confidences), 2),
+            "avg": round(sum(confidences) / total, 2),
             "min": min(confidences),
             "max": max(confidences),
         },
         "priority": {
-            "high": high_priority,
-            "high_pct": round(high_priority / len(scored_leads) * 100, 1),
-            "medium": medium_priority,
-            "medium_pct": round(medium_priority / len(scored_leads) * 100, 1),
-            "low": low_priority,
-            "low_pct": round(low_priority / len(scored_leads) * 100, 1),
-        }
+            "high": high,
+            "high_pct": round(high / total * 100, 1),
+            "medium": medium,
+            "medium_pct": round(medium / total * 100, 1),
+            "low": low,
+            "low_pct": round(low / total * 100, 1),
+        },
+        "opportunities": {
+            "avg_per_lead": round(sum(opp_counts) / total, 1),
+            "by_type": dict(sorted(opp_types.items(), key=lambda x: x[1], reverse=True)),
+        },
     }

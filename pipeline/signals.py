@@ -59,10 +59,41 @@ AUTOMATED_SCHEDULING_PATTERNS = [
     r'schedulicity\.com',
     r'simplybook\.me',
     r'appointy\.com',
+    # Dental / healthcare booking
+    r'zocdoc\.com',
+    r'nexhealth\.com',
+    r'localmed\.com',
+    r'solutionreach\.com',
+    r'doctible\.com',
+    r'patientpop\.com',
+    r'lumahealth\.io',
+    r'weave\.com',
+    r'demandforce\.com',
     
     # Booking platforms (less common for HVAC)
     r'booksy\.com',
     r'vagaro\.com',
+]
+
+# Booking conversion path (dentist-realistic): detect path type from page
+BOOKING_CONVERSION_PATH_FULL = [
+    r"book\s*now",
+    r"book\s*online",
+    r"book\s*an?\s*appointment",
+    r"schedule\s*now",
+    r"schedule\s*online",
+    r"appointment\s*request",  # often leads to scheduler
+]
+BOOKING_CONVERSION_PATH_REQUEST = [
+    r"request\s*appointment",
+    r"request\s*a\s*visit",
+    r"schedule\s*request",
+    r"contact\s*us\s*for\s*appointment",
+]
+BOOKING_CONVERSION_PATH_PHONE_ONLY = [
+    r"call\s*to\s*schedule",
+    r"phone\s*only",
+    r"call\s*for\s*appointment",
 ]
 
 # =============================================================================
@@ -225,6 +256,87 @@ TRUST_BADGE_PATTERNS = [
     r'epa[- ]?certified',
     r'energy\s+star\s+partner',
 ]
+
+
+# =============================================================================
+# PAID ADVERTISING DETECTION (Budget Signal)
+# =============================================================================
+# Detecting ad spend = business has budget and is actively investing.
+# MVP: boolean + channel identification from HTML scripts/pixels.
+#
+# Tri-State: true = ad pixel/tag found, false = page loaded & none found, null = unknown
+# =============================================================================
+
+PAID_ADS_PATTERNS = {
+    "google": [
+        r'googleads\.g\.doubleclick\.net',
+        r'google_conversion',
+        r'gtag\s*\(\s*["\']config["\']',      # gtag('config', 'AW-...')
+        r'AW-\d{5,}',                          # Google Ads conversion ID
+        r'google[-_]?ads',
+        r'adwords',
+        r'googlesyndication\.com',
+        r'googleadservices\.com',
+        r'gads',
+    ],
+    "meta": [
+        r'connect\.facebook\.net.*fbevents',   # Meta Pixel
+        r'fbq\s*\(',                           # fbq('track', ...)
+        r'facebook[-_]?pixel',
+        r'fb[-_]?pixel',
+        r'meta[-_]?pixel',
+        r'_fbp',                                # Facebook browser cookie
+    ],
+    "bing": [
+        r'bat\.bing\.com',
+        r'uetag',                              # Bing UET tag
+    ],
+    "other": [
+        r'adroll\.com',
+        r'ads\.linkedin\.com',
+        r'snap\.licdn\.com',
+        r'ads\.twitter\.com',
+        r'analytics\.tiktok\.com',
+    ],
+}
+
+# =============================================================================
+# HIRING / GROWTH DETECTION (Timing Signal)
+# =============================================================================
+# Active hiring = growth phase = budget available + potential pain points.
+# MVP: detect careers/hiring content from website HTML.
+#
+# Tri-State: true = hiring evidence found, false = page loaded & none, null = unknown
+# =============================================================================
+
+HIRING_LINK_PATTERNS = [
+    r'href=["\'][^"\']*(/careers|/jobs|/hiring|/join[- ]us|/work[- ]with[- ]us|/employment|/openings)',
+    r'href=["\'][^"\']*indeed\.com',
+    r'href=["\'][^"\']*glassdoor\.com',
+    r'href=["\'][^"\']*linkedin\.com/company/[^"\']+/jobs',
+]
+
+HIRING_TEXT_PATTERNS = [
+    r'we\'?re\s+hiring',
+    r'now\s+hiring',
+    r'join\s+our\s+team',
+    r'career\s+opportunities',
+    r'open\s+positions?',
+    r'job\s+openings?',
+    r'apply\s+(now|today|here)',
+    r'looking\s+for\s+(a|an)\s+(technician|installer|dispatcher|office|sales|marketing|service)',
+    r'hiring\s+(a|an)\s+\w+',
+    r'positions?\s+available',
+    r'employment\s+opportunities',
+]
+
+HIRING_ROLE_PATTERNS = {
+    "technician": [r'(hvac|service)\s+technic', r'installer', r'field\s+tech'],
+    "front_desk": [r'(front\s+desk|receptionist|dispatcher|office\s+admin|customer\s+service\s+rep)'],
+    "marketing": [r'marketing\s+(specialist|coordinator|manager)', r'digital\s+market'],
+    "sales": [r'sales\s+(rep|representative|manager|associate)', r'estimator', r'account\s+exec'],
+    "management": [r'(general|operations?|service)\s+manager', r'supervisor'],
+}
 
 
 def normalize_domain(url: str) -> str:
@@ -447,6 +559,158 @@ def _extract_emails(html: str) -> List[str]:
     return list(emails)
 
 
+def _detect_schema_microdata(html: str, html_lower: str, has_substantial_html: bool) -> Tuple[Optional[bool], Optional[List[str]]]:
+    """
+    Detect Organization / LocalBusiness schema in ld+json or itemtype (Phase 0).
+    
+    Returns:
+        (has_schema_microdata, schema_types)
+        - has_schema_microdata: True if any Organization/LocalBusiness found, False if page analyzed and none, None if unknown
+        - schema_types: list of type names e.g. ["Organization", "LocalBusiness"], or None
+    """
+    import json
+    types_found = []
+    
+    # 1) application/ld+json
+    ld_json_blocks = re.findall(
+        r'<script[^>]*type\s*=\s*["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE
+    )
+    for block in ld_json_blocks:
+        block = block.strip()
+        if not block:
+            continue
+        try:
+            data = json.loads(block)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        t = item.get("@type")
+                        if t:
+                            types_found.extend(t if isinstance(t, list) else [t])
+            continue
+        at_type = data.get("@type")
+        if at_type:
+            types_found.extend(at_type if isinstance(at_type, list) else [at_type])
+    
+    # 2) itemtype (microdata) e.g. itemtype="https://schema.org/LocalBusiness"
+    itemtype_matches = re.findall(
+        r'itemtype\s*=\s*["\'](?:https?:)?//schema\.org/([^"\'>\s]+)["\']',
+        html_lower
+    )
+    types_found.extend(itemtype_matches)
+    
+    # Normalize: "Organization", "LocalBusiness" (strip URL prefix if any)
+    wanted = {"organization", "localbusiness"}
+    found_normalized = []
+    for t in types_found:
+        if not t:
+            continue
+        name = (t.split("/")[-1] if "/" in t else t).strip().lower()
+        if name in wanted and name not in found_normalized:
+            found_normalized.append(name)
+    
+    if found_normalized:
+        schema_types = [s.title() for s in found_normalized]
+        return True, schema_types
+    if has_substantial_html:
+        return False, []
+    return None, None
+
+
+# =============================================================================
+# PHASE 0.1: Social links, phone/address in HTML
+# =============================================================================
+
+# Social platform URL patterns (href or plain URL on page)
+SOCIAL_URL_PATTERNS = {
+    "facebook": r'facebook\.com',
+    "instagram": r'instagram\.com',
+    "linkedin": r'linkedin\.com',
+    "twitter": r'(?:twitter\.com|x\.com)',
+    "yelp": r'yelp\.com',
+    "youtube": r'youtube\.com',
+    "tiktok": r'tiktok\.com',
+    "pinterest": r'pinterest\.com',
+}
+
+# US-style phone: (xxx) xxx-xxxx, xxx-xxx-xxxx, xxx.xxx.xxxx, 10+ digits
+PHONE_IN_HTML_PATTERNS = [
+    r'<a[^>]*href\s*=\s*["\']tel:[^"\']+["\']',  # tel: link
+    r'\(\d{3}\)\s*\d{3}[-.\s]?\d{4}',             # (123) 456-7890
+    r'\d{3}[-.\s]\d{3}[-.\s]\d{4}',               # 123-456-7890
+]
+
+# Address in HTML: schema.org or simple street pattern
+ADDRESS_IN_HTML_PATTERNS = [
+    r'streetAddress["\']\s*:\s*["\']',            # ld+json
+    r'["\']streetAddress["\']',                    # schema
+    r'\d{1,6}\s+[\w\s]+(?:street|st|avenue|ave|blvd|road|rd|drive|dr|way|lane|ln)[\s,.]',  # 123 Main St
+    r'suite\s+\d+',                                # Suite 100
+]
+
+
+# LinkedIn company page: linkedin.com/company/slug
+LINKEDIN_COMPANY_PATTERN = re.compile(
+    r'https?://(?:www\.)?linkedin\.com/company/([a-zA-Z0-9_-]+)',
+    re.IGNORECASE
+)
+
+
+def _extract_linkedin_company_url(html: str) -> Optional[str]:
+    """
+    Extract first LinkedIn company page URL from HTML.
+    Returns full URL (https://www.linkedin.com/company/slug) or None.
+    """
+    if not html:
+        return None
+    m = LINKEDIN_COMPANY_PATTERN.search(html)
+    if m:
+        slug = m.group(1)
+        return f"https://www.linkedin.com/company/{slug}"
+    return None
+
+
+def _detect_social_links(html_lower: str, has_substantial_html: bool) -> Tuple[Optional[bool], Optional[List[str]]]:
+    """
+    Detect social profile links in HTML (Phase 0.1).
+    Returns (has_social_links, social_platforms).
+    """
+    found = []
+    for platform, pattern in SOCIAL_URL_PATTERNS.items():
+        if re.search(pattern, html_lower):
+            found.append(platform)
+    if found:
+        return True, found
+    if has_substantial_html:
+        return False, []
+    return None, None
+
+
+def _detect_phone_in_html(html: str, html_lower: str, has_substantial_html: bool) -> Optional[bool]:
+    """Detect phone number on page (tel: link or US-style number). Phase 0.1."""
+    for pattern in PHONE_IN_HTML_PATTERNS:
+        if re.search(pattern, html_lower, re.IGNORECASE):
+            return True
+    if has_substantial_html:
+        return False
+    return None
+
+
+def _detect_address_in_html(html_lower: str, has_substantial_html: bool) -> Optional[bool]:
+    """Detect physical address on page (schema or street pattern). Phase 0.1."""
+    for pattern in ADDRESS_IN_HTML_PATTERNS:
+        if re.search(pattern, html_lower):
+            return True
+    if has_substantial_html:
+        return False
+    return None
+
+
 def _analyze_html_content(html: str) -> Dict:
     """
     Analyze HTML content for signals using AGENCY-SAFE tri-state semantics.
@@ -548,11 +812,26 @@ def _analyze_html_content(html: str) -> Dict:
     if has_scheduling_evidence:
         has_automated_scheduling = True
     elif has_substantial_html:
-        # Page analyzed, no scheduling tools found - can set false
-        # (This is different from contact form - scheduling tools are explicit)
         has_automated_scheduling = False
     else:
         has_automated_scheduling = None
+
+    # =========================================================================
+    # BOOKING CONVERSION PATH (dentist-realistic: Phone-only | Request form | Online booking limited/full)
+    # =========================================================================
+    booking_conversion_path = None
+    if has_substantial_html:
+        has_full_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_FULL)
+        has_request_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_REQUEST)
+        has_phone_only_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_PHONE_ONLY)
+        if has_scheduling_evidence and has_full_cta:
+            booking_conversion_path = "Online booking (full)"
+        elif has_scheduling_evidence:
+            booking_conversion_path = "Online booking (limited)"
+        elif has_request_cta or (has_contact_form and not has_scheduling_evidence):
+            booking_conversion_path = "Request form"
+        elif has_phone_only_cta or (not has_contact_form and not has_scheduling_evidence):
+            booking_conversion_path = "Phone-only"
     
     # =========================================================================
     # TRUST BADGES: Established business indicator
@@ -569,13 +848,83 @@ def _analyze_html_content(html: str) -> Dict:
     else:
         has_trust_badges = None
     
+    # =========================================================================
+    # PAID ADVERTISING: Budget signal
+    # =========================================================================
+    detected_ad_channels = []
+    for channel, patterns in PAID_ADS_PATTERNS.items():
+        if any(re.search(p, html_lower, re.IGNORECASE) for p in patterns):
+            detected_ad_channels.append(channel)
+    
+    if detected_ad_channels:
+        runs_paid_ads = True
+    elif has_substantial_html:
+        runs_paid_ads = False
+    else:
+        runs_paid_ads = None
+    
+    # =========================================================================
+    # HIRING / GROWTH: Timing signal
+    # =========================================================================
+    has_hiring_links = any(
+        re.search(p, html_lower, re.IGNORECASE) for p in HIRING_LINK_PATTERNS
+    )
+    has_hiring_text = any(
+        re.search(p, html_lower, re.IGNORECASE) for p in HIRING_TEXT_PATTERNS
+    )
+    # Link-only rule: href to /careers or /jobs or /hiring → hiring_active = True (no second fetch)
+    if has_hiring_links or has_hiring_text:
+        hiring_active = True
+        hiring_signal_source = "careers_link_only" if (has_hiring_links and not has_hiring_text) else None
+    elif has_substantial_html:
+        hiring_active = False
+        hiring_signal_source = None
+    else:
+        hiring_active = None
+        hiring_signal_source = None
+    
+    # Detect specific roles being hired (only when we have hiring text to scan)
+    detected_roles = []
+    if hiring_active:
+        for role, patterns in HIRING_ROLE_PATTERNS.items():
+            if any(re.search(p, html_lower, re.IGNORECASE) for p in patterns):
+                detected_roles.append(role)
+    
+    # =========================================================================
+    # SCHEMA / MICRODATA: Organization, LocalBusiness (Phase 0)
+    # =========================================================================
+    has_schema_microdata, schema_types = _detect_schema_microdata(html, html_lower, has_substantial_html)
+    
+    # =========================================================================
+    # PHASE 0.1: Social links, phone/address in HTML, LinkedIn company
+    # =========================================================================
+    has_social_links, social_platforms = _detect_social_links(html_lower, has_substantial_html)
+    has_phone_in_html = _detect_phone_in_html(html, html_lower, has_substantial_html)
+    has_address_in_html = _detect_address_in_html(html_lower, has_substantial_html)
+    linkedin_company_url = _extract_linkedin_company_url(html)
+    
     return {
         "mobile_friendly": mobile_friendly,
         "has_contact_form": has_contact_form,
         "has_email": has_email,
         "email_address": email_address,
         "has_automated_scheduling": has_automated_scheduling,
+        "booking_conversion_path": booking_conversion_path,
         "has_trust_badges": has_trust_badges,
+        # New signal families
+        "runs_paid_ads": runs_paid_ads,
+        "paid_ads_channels": detected_ad_channels if detected_ad_channels else None,
+        "hiring_active": hiring_active,
+        "hiring_roles": detected_roles if detected_roles else None,
+        "hiring_signal_source": hiring_signal_source,
+        "has_schema_microdata": has_schema_microdata,
+        "schema_types": schema_types,
+        # Phase 0.1
+        "has_social_links": has_social_links,
+        "social_platforms": social_platforms if social_platforms else None,
+        "has_phone_in_html": has_phone_in_html,
+        "has_address_in_html": has_address_in_html,
+        "linkedin_company_url": linkedin_company_url,
         "_has_substantial_html": has_substantial_html,
     }
 
@@ -614,9 +963,23 @@ def analyze_website(url: str) -> Dict:
         "has_email": None,             # Unknown until HTML analyzed (NEVER false)
         "email_address": None,
         "has_automated_scheduling": None,
+        "booking_conversion_path": None,
         "has_trust_badges": None,
         "page_load_time_ms": None,
         "website_accessible": None,
+        # New signal families
+        "runs_paid_ads": None,
+        "paid_ads_channels": None,
+        "hiring_active": None,
+        "hiring_roles": None,
+        "hiring_signal_source": None,
+        "has_schema_microdata": None,
+        "schema_types": None,
+        "has_social_links": None,
+        "social_platforms": None,
+        "has_phone_in_html": None,
+        "has_address_in_html": None,
+        "linkedin_company_url": None,
     }
     
     headers = {
@@ -646,7 +1009,21 @@ def analyze_website(url: str) -> Dict:
         signals["has_email"] = content_signals["has_email"]
         signals["email_address"] = content_signals["email_address"]
         signals["has_automated_scheduling"] = content_signals["has_automated_scheduling"]
+        signals["booking_conversion_path"] = content_signals.get("booking_conversion_path")
         signals["has_trust_badges"] = content_signals["has_trust_badges"]
+        # New signal families
+        signals["runs_paid_ads"] = content_signals["runs_paid_ads"]
+        signals["paid_ads_channels"] = content_signals["paid_ads_channels"]
+        signals["hiring_active"] = content_signals["hiring_active"]
+        signals["hiring_roles"] = content_signals["hiring_roles"]
+        signals["hiring_signal_source"] = content_signals.get("hiring_signal_source")
+        signals["has_schema_microdata"] = content_signals["has_schema_microdata"]
+        signals["schema_types"] = content_signals["schema_types"]
+        signals["has_social_links"] = content_signals["has_social_links"]
+        signals["social_platforms"] = content_signals["social_platforms"]
+        signals["has_phone_in_html"] = content_signals["has_phone_in_html"]
+        signals["has_address_in_html"] = content_signals["has_address_in_html"]
+        signals["linkedin_company_url"] = content_signals["linkedin_company_url"]
     else:
         # Could not retrieve HTML - site is not accessible
         # We KNOW it's not accessible (confident false)
@@ -655,6 +1032,72 @@ def analyze_website(url: str) -> Dict:
         signals["website_accessible"] = False
     
     return signals
+
+
+def _calculate_review_trends(reviews: List[Dict], review_count: int) -> Dict:
+    """
+    Calculate review direction signals from available review data.
+    
+    Uses the up to 5 reviews returned by Google Places to estimate:
+    - review_velocity_30d: approximate reviews per 30 days
+    - rating_delta_60d: rating trend (positive = improving, negative = declining)
+    
+    These are estimates from limited data. Accuracy > completeness.
+    
+    Args:
+        reviews: List of review dicts from Place Details API
+        review_count: Total review count from Google
+    
+    Returns:
+        Dictionary with trend signals
+    """
+    now = datetime.now(tz=timezone.utc)
+    
+    if not reviews:
+        return {
+            "review_velocity_30d": None,
+            "rating_delta_60d": None,
+        }
+    
+    # Parse review timestamps and ratings
+    parsed_reviews = []
+    for review in reviews:
+        ts = review.get("time")
+        rating = review.get("rating")
+        if ts and rating is not None:
+            review_date = datetime.fromtimestamp(ts, tz=timezone.utc)
+            days_ago = (now - review_date).days
+            parsed_reviews.append({"days_ago": days_ago, "rating": rating})
+    
+    if not parsed_reviews:
+        return {
+            "review_velocity_30d": None,
+            "rating_delta_60d": None,
+        }
+    
+    # --- Review Velocity (30d) ---
+    # Count reviews in last 30 days from available sample
+    # This is a lower-bound estimate (Google returns "most relevant", not all)
+    recent_30d = sum(1 for r in parsed_reviews if r["days_ago"] <= 30)
+    review_velocity_30d = recent_30d
+    
+    # --- Rating Delta (60d) ---
+    # Compare average rating of reviews in last 60 days vs older
+    recent_60d = [r for r in parsed_reviews if r["days_ago"] <= 60]
+    older = [r for r in parsed_reviews if r["days_ago"] > 60]
+    
+    if recent_60d and older:
+        recent_avg = sum(r["rating"] for r in recent_60d) / len(recent_60d)
+        older_avg = sum(r["rating"] for r in older) / len(older)
+        rating_delta_60d = round(recent_avg - older_avg, 2)
+    else:
+        # Not enough data to compute trend
+        rating_delta_60d = None
+    
+    return {
+        "review_velocity_30d": review_velocity_30d,
+        "rating_delta_60d": rating_delta_60d,
+    }
 
 
 def extract_signals(lead: Dict) -> Dict:
@@ -708,10 +1151,30 @@ def extract_signals(lead: Dict) -> Dict:
             "has_email": None,           # Unknown (NEVER false)
             "email_address": None,
             "has_automated_scheduling": None,
+            "booking_conversion_path": None,
             "has_trust_badges": None,
             "page_load_time_ms": None,
             "website_accessible": None,
+            "runs_paid_ads": None,
+            "paid_ads_channels": None,
+            "hiring_active": None,
+            "hiring_roles": None,
+            "hiring_signal_source": None,
+            "has_schema_microdata": None,
+            "schema_types": None,
+            "has_social_links": None,
+            "social_platforms": None,
+            "has_phone_in_html": None,
+            "has_address_in_html": None,
+            "linkedin_company_url": None,
         }
+    
+    # Calculate review trends from available review data
+    review_trends = _calculate_review_trends(reviews, review_count)
+    
+    # Review context: summary + themes from review text (optional LLM)
+    from pipeline.review_context import build_review_context
+    review_context = build_review_context(reviews, rating=rating, review_count=review_count)
     
     # Build final signals object with AGENCY-SAFE TRI-STATE SEMANTICS
     # 
@@ -756,6 +1219,7 @@ def extract_signals(lead: Dict) -> Dict:
         
         # Operational maturity - can be false (explicit signal)
         "has_automated_scheduling": website_signals["has_automated_scheduling"],
+        "booking_conversion_path": website_signals.get("booking_conversion_path"),
         
         # Trust/reputation signals
         "has_trust_badges": website_signals["has_trust_badges"],
@@ -763,10 +1227,37 @@ def extract_signals(lead: Dict) -> Dict:
         "page_load_time_ms": website_signals["page_load_time_ms"],
         "website_accessible": website_signals["website_accessible"],
         
+        # Paid advertising signals (BUDGET indicator)
+        "runs_paid_ads": website_signals["runs_paid_ads"],
+        "paid_ads_channels": website_signals["paid_ads_channels"],
+        
+        # Hiring/growth signals (TIMING indicator)
+        "hiring_active": website_signals["hiring_active"],
+        "hiring_roles": website_signals["hiring_roles"],
+        "hiring_signal_source": website_signals.get("hiring_signal_source"),
+        
+        # Schema/microdata (Phase 0)
+        "has_schema_microdata": website_signals.get("has_schema_microdata"),
+        "schema_types": website_signals.get("schema_types"),
+        # Phase 0.1: social, phone/address in HTML
+        "has_social_links": website_signals.get("has_social_links"),
+        "social_platforms": website_signals.get("social_platforms"),
+        "has_phone_in_html": website_signals.get("has_phone_in_html"),
+        "has_address_in_html": website_signals.get("has_address_in_html"),
+        "linkedin_company_url": website_signals.get("linkedin_company_url"),
+        
         # Review signals - business activity indicator
         "rating": rating,
         "review_count": review_count,
         "last_review_days_ago": last_review_days_ago,
+        
+        # Review direction signals (PAIN indicator)
+        "review_velocity_30d": review_trends["review_velocity_30d"],
+        "rating_delta_60d": review_trends["rating_delta_60d"],
+        # Review context (summary + themes from text)
+        "review_summary_text": review_context.get("review_summary"),
+        "review_themes": review_context.get("review_themes") or [],
+        "review_sample_snippets": review_context.get("review_sample_snippets") or [],
     }
     
     return signals

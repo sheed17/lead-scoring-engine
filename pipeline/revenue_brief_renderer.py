@@ -1,0 +1,1006 @@
+"""
+Revenue Intelligence Brief — UI rendering.
+
+Primary sources: objective_intelligence, revenue_intelligence, competitive_snapshot, signals.
+summary_60s / objective_decision_layer / canonical_summary_v1 used only as fallback.
+No LLM. No new calculations (only normalization + formatting).
+No model version labels. Wording focused on SEO for dental practices (local visibility, service pages, schema, GBP, review velocity).
+"""
+
+from typing import Dict, Any, List, Optional, Tuple
+
+
+def _is_dental_for_brief(lead: Dict[str, Any]) -> bool:
+    """Lightweight dental check for brief rendering (avoids heavy dentist_profile import)."""
+    if lead.get("dentist_profile_v1"):
+        return True
+    if (lead.get("objective_intelligence") or {}).get("service_intel"):
+        return True
+    name = (lead.get("name") or "").lower()
+    if "dental" in name or "dentist" in name:
+        return True
+    return False
+
+# Canonical service buckets: canonical_label -> list of raw strings to match (lowercase)
+CANONICAL_SERVICE_BUCKETS: Dict[str, List[str]] = {
+    "implants": ["implant", "dental implant", "implants"],
+    "orthodontics": ["orthodontic", "orthodontics", "invisalign", "braces"],
+    "veneers": ["veneer", "veneers"],
+    "emergency": ["emergency", "emergency dental"],
+    "cosmetic": ["cosmetic", "cosmetic dentistry"],
+}
+CANONICAL_ORDER = ["Implants", "Orthodontics", "Veneers", "Emergency", "Cosmetic"]
+
+# Bottleneck snake_case -> Title Case
+BOTTLENECK_TO_LABEL: Dict[str, str] = {
+    "saturation_limited": "Saturation Limited",
+    "visibility_limited": "Visibility Limited",
+    "conversion_constrained": "Conversion Constrained",
+    "capture_constrained": "Capture Constrained",
+    "trust_limited": "Trust Limited",
+}
+
+# Bottleneck -> short leverage label (for Primary Leverage)
+BOTTLENECK_TO_LEVERAGE: Dict[str, str] = {
+    "saturation_limited": "High-ticket capture",
+    "visibility_limited": "Visibility",
+    "conversion_constrained": "Conversion",
+    "capture_constrained": "High-ticket capture",
+    "trust_limited": "Trust",
+}
+
+# Primary service for revenue upside section: priority order (first match from missing_high_value_pages wins)
+PRIMARY_SERVICE_PRIORITY: List[Tuple[str, str]] = [
+    ("implants", "Implants"),
+    ("invisalign", "Invisalign"),
+    ("orthodontic", "Orthodontic"),
+    ("veneers", "Veneers"),
+    ("cosmetic", "Cosmetic"),
+]
+# Case value proxy (low, high) per canonical key for revenue breakdown — tight deterministic bands
+PRIMARY_SERVICE_CASE_VALUE: Dict[str, Tuple[int, int]] = {
+    "implants": (4000, 6000),
+    "invisalign": (3500, 5500),
+    "orthodontic": (3500, 5500),
+    "veneers": (3000, 5000),
+    "cosmetic": (3000, 5000),
+}
+# Consult range (low, high) per traffic_estimate_tier — max spread 2x
+TRAFFIC_TIER_CONSULTS: Dict[str, Tuple[int, int]] = {
+    "High": (3, 6),
+    "Moderate": (2, 4),
+}
+DEFAULT_CONSULTS = (1, 3)
+DEFAULT_CASE_VALUE = (2500, 4000)
+
+
+def compute_opportunity_profile(lead: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Deterministic Opportunity Profile label and short parenthetical why.
+    No LLM. No new APIs. Uses objective_intelligence, competitive_snapshot, revenue_intelligence, signals.
+    Returns {"label": "High-Leverage"|"Moderate"|"Low-Leverage", "why": "..."} or {} when omitted.
+    """
+    try:
+        oi = lead.get("objective_intelligence") or {}
+        cs = lead.get("competitive_snapshot") or oi.get("competitive_profile") or {}
+        ri = lead.get("revenue_intelligence") or {}
+        if lead.get("signals") and isinstance(lead["signals"], dict):
+            signals = lead["signals"]
+        else:
+            signals = {k: v for k, v in lead.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating")}
+        service = oi.get("service_intel") or lead.get("service_intelligence") or {}
+
+        missing_pages = service.get("missing_high_value_pages")
+        missing_high_value = bool(missing_pages and (isinstance(missing_pages, list) and len(missing_pages) > 0))
+
+        schema_detected = service.get("schema_detected")
+        if schema_detected is None:
+            schema_detected = signals.get("signal_has_schema_microdata")
+        schema_missing = (schema_detected is False)
+
+        market_density = (cs.get("market_density_score") or "").strip() or (oi.get("competitive_profile") or {}).get("market_density") or ""
+        high_density = (market_density == "High")
+
+        reviews = lead.get("signal_review_count") or signals.get("signal_review_count") or signals.get("user_ratings_total") or lead.get("user_ratings_total") or 0
+        try:
+            reviews = int(reviews)
+        except (TypeError, ValueError):
+            reviews = 0
+
+        local_avg = cs.get("avg_review_count") if cs.get("avg_review_count") is not None else cs.get("avg_reviews")
+        try:
+            local_avg_reviews = float(local_avg) if local_avg is not None else 0
+        except (TypeError, ValueError):
+            local_avg_reviews = 0
+
+        review_deficit = (local_avg_reviews > 0 and reviews < 0.5 * local_avg_reviews)
+
+        paid_channels = signals.get("signal_paid_ads_channels")
+        paid_active = (
+            signals.get("signal_runs_paid_ads") is True
+            or (isinstance(paid_channels, list) and len(paid_channels) > 0)
+            or (paid_channels and not isinstance(paid_channels, list))
+        )
+
+        if missing_high_value and high_density and (schema_missing or paid_active or review_deficit):
+            label = "High-Leverage"
+        elif missing_high_value and (high_density or schema_missing or paid_active):
+            label = "Moderate"
+        else:
+            label = "Low-Leverage"
+
+        fragments = []
+        if missing_high_value:
+            fragments.append("high-ticket service offered but missing dedicated landing page")
+        if schema_missing:
+            fragments.append("schema support missing")
+        if review_deficit:
+            fragments.append("review authority below local market")
+        if paid_active:
+            fragments.append("paid demand present but capture layer is weak")
+        if high_density:
+            fragments.append("high-density competitive market")
+        why = ", ".join(fragments[:3])
+        if not why:
+            why = "baseline capture and market conditions"
+
+        return {"label": label, "why": why}
+    except Exception:
+        return {}
+
+
+def compute_paid_demand_status(lead: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Deterministic Paid Demand Status from existing signals.
+    No LLM. No new APIs.
+    Returns {"status": "...", "interpretation": "..."} or {} when omitted.
+    """
+    try:
+        signals = lead.get("signals")
+        if not isinstance(signals, dict):
+            signals = {k: v for k, v in lead.items() if k.startswith("signal_")}
+        ri = lead.get("revenue_intelligence") or {}
+        cs = lead.get("competitive_snapshot") or (lead.get("objective_intelligence") or {}).get("competitive_profile") or {}
+        oi = lead.get("objective_intelligence") or {}
+        service_intel = oi.get("service_intel") or oi.get("service_intelligence") or lead.get("service_intelligence") or {}
+
+        channels = signals.get("signal_paid_ads_channels") or []
+        if not isinstance(channels, list):
+            channels = [channels] if channels else []
+        channels_lower = [str(c).strip().lower() for c in channels if c]
+
+        runs_google = signals.get("signal_runs_paid_ads") is True and "google" in channels_lower
+        runs_meta = "meta" in channels_lower
+        high_density = (
+            (cs.get("market_density_score") or "").strip() == "High"
+            or (cs.get("market_density") or "").strip() == "High"
+        )
+        high_ticket_raw = service_intel.get("high_ticket_detected") or service_intel.get("high_ticket_procedures_detected")
+        high_ticket = bool(high_ticket_raw and (isinstance(high_ticket_raw, list) and len(high_ticket_raw) > 0))
+
+        if not runs_google and not runs_meta:
+            return {"status": "Inactive", "interpretation": "No detectable paid demand activity."}
+        if runs_google and high_density and high_ticket:
+            return {"status": "Aggressive Search Presence", "interpretation": "Practice appears to be competing actively for high-value service demand."}
+        if runs_google and runs_meta:
+            return {"status": "Active (Search + Meta)", "interpretation": "Practice is investing in both high-intent and awareness channels."}
+        if runs_google:
+            return {"status": "Active (Search)", "interpretation": "Practice is investing in high-intent search demand."}
+        if runs_meta:
+            return {"status": "Active (Meta)", "interpretation": "Practice has Meta ads presence."}
+        return {}
+    except Exception:
+        return {}
+
+
+def _primary_service_from_missing(missing: List[str]) -> Optional[Tuple[str, str]]:
+    """
+    Select ONE primary service from missing_high_value_pages.
+    Priority: implants > invisalign > orthodontic > veneers > cosmetic.
+    Returns (canonical_key, display_name) or None if no match.
+    """
+    if not missing:
+        return None
+    missing_lower = [str(m).strip().lower() for m in missing if m]
+    for key, display in PRIMARY_SERVICE_PRIORITY:
+        for m in missing_lower:
+            if key in m or m in key:
+                return (key, display)
+        if key == "orthodontic":
+            if any(any(x in m for x in ("orthodont", "brace")) for m in missing_lower):
+                return ("orthodontic", "Orthodontic")
+    return None
+
+
+def _get_summary_60s(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Resolve summary_60s: agency_decision_v1.summary_60s > canonical_summary_v1 > internal_debug."""
+    adv1 = lead.get("agency_decision_v1")
+    if adv1 and isinstance(adv1, dict):
+        s = adv1.get("summary_60s")
+        if s and isinstance(s, dict):
+            return s
+    s = lead.get("canonical_summary_v1")
+    if s and isinstance(s, dict):
+        return s
+    debug = lead.get("internal_debug")
+    if debug and isinstance(debug, dict):
+        adv1 = debug.get("agency_decision_v1_deprecated")
+        if adv1 and isinstance(adv1, dict):
+            s = adv1.get("summary_60s")
+            if s and isinstance(s, dict):
+                return s
+    return None
+
+
+def _get_revenue_intelligence(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """revenue_intelligence from lead or signals."""
+    rev = lead.get("revenue_intelligence")
+    if rev and isinstance(rev, dict):
+        return rev
+    sig = lead.get("signals")
+    if sig and isinstance(sig, dict):
+        rev = sig.get("revenue_intelligence")
+        if rev and isinstance(rev, dict):
+            return rev
+    return {}
+
+
+def _get_signals(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """Signals: lead.signals or top-level signal_* / user_ratings_total / rating."""
+    if lead.get("signals") and isinstance(lead["signals"], dict):
+        return lead["signals"]
+    return {k: v for k, v in lead.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating")}
+
+
+def _get_objective_intelligence(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """objective_intelligence from lead (primary source for root constraint, intervention plan, etc.)."""
+    oi = lead.get("objective_intelligence")
+    if oi and isinstance(oi, dict):
+        return oi
+    return {}
+
+
+def _get_objective_layer(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """objective_decision_layer or models (fallback when objective_intelligence missing)."""
+    obj = lead.get("objective_decision_layer")
+    if obj and isinstance(obj, dict):
+        return obj
+    return lead.get("models") or {}
+
+
+def _get_competitive_snapshot(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """competitive_snapshot from objective_layer, lead, or signals."""
+    obj = _get_objective_layer(lead)
+    comp = obj.get("competitive_snapshot") if obj else None
+    if comp and isinstance(comp, dict):
+        return comp
+    comp = lead.get("competitive_snapshot")
+    if comp and isinstance(comp, dict):
+        return comp
+    sig = lead.get("signals")
+    if sig and isinstance(sig, dict):
+        comp = sig.get("competitive_snapshot")
+        if comp and isinstance(comp, dict):
+            return comp
+    return {}
+
+
+def _get_dentist_profile(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """dentist_profile_v1 from lead or internal_debug."""
+    profile = lead.get("dentist_profile_v1")
+    if profile and isinstance(profile, dict):
+        return profile
+    debug = lead.get("internal_debug")
+    if debug and isinstance(debug, dict):
+        return debug.get("dentist_profile_v1") or {}
+    return {}
+
+
+def _snake_to_title(s: str) -> str:
+    """snake_case -> Title Case."""
+    if not s:
+        return s
+    return " ".join(w.capitalize() for w in s.split("_"))
+
+
+def _fmt_currency(val: Any) -> str:
+    """Format number as $X.XM or $Xk."""
+    if val is None:
+        return ""
+    try:
+        n = int(float(val))
+        if n >= 1_000_000:
+            return f"${n / 1_000_000:.1f}M"
+        if n >= 1_000:
+            return f"${n / 1_000:.0f}k"
+        return f"${n:,}"
+    except (TypeError, ValueError):
+        return str(val)
+
+
+def _normalize_to_canonical_services(
+    high_ticket: List[str], missing: List[str]
+) -> Tuple[List[str], List[str]]:
+    """
+    Map raw procedure/page names to canonical buckets. Returns (detected_canonical, missing_canonical)
+    in priority order: Implants, Orthodontics, Veneers, Emergency, Cosmetic.
+    """
+    def match_bucket(raw: str) -> Optional[str]:
+        r = (raw or "").strip().lower()
+        for canonical_key, aliases in CANONICAL_SERVICE_BUCKETS.items():
+            if r in aliases or any(r == a for a in aliases):
+                return canonical_key
+        return None
+
+    detected_set = set()
+    for item in high_ticket or []:
+        if not isinstance(item, str):
+            continue
+        b = match_bucket(item)
+        if b:
+            detected_set.add(b)
+
+    missing_set = set()
+    for item in missing or []:
+        if not isinstance(item, str):
+            continue
+        b = match_bucket(item)
+        if b:
+            missing_set.add(b)
+
+    order_keys = [k for k in ["implants", "orthodontics", "veneers", "emergency", "cosmetic"]]
+    detected_list = [k.capitalize() for k in order_keys if k in detected_set]
+    missing_list = [k.capitalize() for k in order_keys if k in missing_set]
+    return (detected_list, missing_list)
+
+
+def _dedupe_risks_preserve_order(
+    cost_leakage: List[str], primary_risks: List[str], risk_flags: List[str]
+) -> List[str]:
+    """Deduplicate risk statements; order: cost_leakage, then primary_risks, then risk_flags."""
+    seen_lower = set()
+    out = []
+    for src in (cost_leakage or [], primary_risks or [], risk_flags or []):
+        for s in (src if isinstance(src, list) else []):
+            if not s or not isinstance(s, str):
+                continue
+            key = s.lower().strip()[:80]
+            if key in seen_lower:
+                continue
+            seen_lower.add(key)
+            out.append(s.strip())
+    return out
+
+
+def _flatten_supporting_evidence(s60: Optional[Dict[str, Any]], max_items: int = 5) -> List[str]:
+    """Flatten summary_60s.supporting_evidence into a list of strings (max_items)."""
+    if not s60:
+        return []
+    evidence = s60.get("supporting_evidence")
+    if not evidence or not isinstance(evidence, dict):
+        return []
+    out = []
+    for key in ("reputation_signals", "market_signals", "digital_signals", "traffic_signals", "revenue_signals"):
+        arr = evidence.get(key)
+        if isinstance(arr, list):
+            for x in arr:
+                if isinstance(x, str) and x.strip():
+                    out.append(x.strip())
+                    if len(out) >= max_items:
+                        return out[:max_items]
+    return out[:max_items]
+
+
+def _dedupe_evidence(bullets: List[str], max_items: int = 10) -> List[str]:
+    """Deduplicate evidence bullets by normalized text; preserve order."""
+    seen = set()
+    out = []
+    for b in bullets:
+        if not b or not isinstance(b, str):
+            continue
+        n = b.strip().lower()[:100]
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(b.strip())
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build view model from lead. Source priority:
+    1) objective_intelligence, revenue_intelligence, competitive_snapshot, signals
+    2) objective_decision_layer, agency_decision_v1.summary_60s, canonical_summary_v1
+    Missing data => omit subsection or field; no fabrication.
+    """
+    oi = _get_objective_intelligence(lead)
+    s60 = _get_summary_60s(lead)
+    rev = _get_revenue_intelligence(lead)
+    signals = _get_signals(lead)
+    obj = _get_objective_layer(lead)
+    comp = _get_competitive_snapshot(lead)
+    profile = _get_dentist_profile(lead)
+
+    vm = {
+        "executive_diagnosis": {},
+        "market_position": {},
+        "competitive_context": {},
+        "competitive_service_gap": None,
+        "strategic_gap": None,
+        "revenue_upside_capture_gap": None,
+        "demand_signals": {},
+        "high_ticket_gaps": {},
+        "conversion_infrastructure": {},
+        "risk_flags": [],
+        "intervention_plan": [],
+        "intervention_fallback": None,
+        "evidence_bullets": [],
+        "executive_footnote": "",
+    }
+
+    # Resolve organic_revenue_gap (priority: rev > s60)
+    gap = rev.get("organic_revenue_gap_estimate")
+    if not gap or not isinstance(gap, dict):
+        gap = (s60 or {}).get("organic_revenue_gap_estimate")
+    gap_lo = gap.get("lower") if isinstance(gap, dict) else None
+    gap_hi = gap.get("upper") if isinstance(gap, dict) else None
+
+    # ---------- 1) Executive Diagnosis (prefer objective_intelligence) ----------
+    rc_oi = (oi.get("root_constraint") or {}) if oi else {}
+    constraint = (rc_oi.get("label") or "").strip() if isinstance(rc_oi, dict) else None
+    if not constraint:
+        rbc = (obj.get("root_bottleneck_classification") or {}) if obj else {}
+        bottleneck_raw = rbc.get("bottleneck")
+        if bottleneck_raw and isinstance(bottleneck_raw, str):
+            constraint = BOTTLENECK_TO_LABEL.get(bottleneck_raw) or _snake_to_title(bottleneck_raw)
+        else:
+            constraint = (s60 or {}).get("root_constraint")
+    if constraint:
+        vm["executive_diagnosis"]["constraint"] = constraint
+
+    primary_leverage = None
+    pgv = (oi.get("primary_growth_vector") or {}) if oi else {}
+    if isinstance(pgv, dict) and (pgv.get("label") or "").strip():
+        primary_leverage = (pgv.get("label") or "").strip()
+    if not primary_leverage:
+        rbc = (obj.get("root_bottleneck_classification") or {}) if obj else {}
+        bottleneck_raw = rbc.get("bottleneck")
+        leverage_type = BOTTLENECK_TO_LEVERAGE.get(bottleneck_raw, "High-ticket capture") if bottleneck_raw else None
+        rla = (obj.get("revenue_leverage_analysis") or {}) if obj else {}
+        driver_detected = rla.get("primary_revenue_driver_detected")
+        driver_label = _snake_to_title(driver_detected) if isinstance(driver_detected, str) else (s60 or {}).get("primary_revenue_driver")
+        if leverage_type:
+            primary_leverage = leverage_type
+            if driver_label:
+                primary_leverage = f"{leverage_type} ({driver_label})"
+    if primary_leverage:
+        vm["executive_diagnosis"]["primary_leverage"] = primary_leverage
+
+    opp = compute_opportunity_profile(lead)
+    if opp and opp.get("label") and opp.get("why"):
+        vm["executive_diagnosis"]["opportunity_profile"] = opp
+
+    if gap_lo is not None and gap_hi is not None:
+        vm["executive_diagnosis"]["modeled_revenue_upside"] = f"{_fmt_currency(gap_lo)}–{_fmt_currency(gap_hi)} annually"
+
+    vm["executive_footnote"] = "Modeled from public proxy signals; not GA4/Ads platform."
+
+    # ---------- 2) Market Position ----------
+    band = rev.get("revenue_band_estimate") or (s60 or {}).get("revenue_band")
+    if isinstance(band, dict) and band.get("lower") is not None and band.get("upper") is not None:
+        vm["market_position"]["revenue_band"] = f"{_fmt_currency(band['lower'])}–{_fmt_currency(band['upper'])}"
+    rc = signals.get("signal_review_count") or signals.get("user_ratings_total")
+    rt = signals.get("signal_rating") or signals.get("rating")
+    if rc is not None:
+        vm["market_position"]["reviews"] = f"{rc}" + (f" ({rt})" if rt is not None else "")
+    avg = comp.get("avg_review_count")
+    if avg is not None:
+        try:
+            vm["market_position"]["local_avg"] = f"{float(avg):.0f}"
+        except (TypeError, ValueError):
+            vm["market_position"]["local_avg"] = str(avg)
+    density = comp.get("market_density_score")
+    if density:
+        vm["market_position"]["market_density"] = str(density)
+
+    # ---------- 2b) Competitive Context (SEO for dentists: local visibility, competitors) ----------
+    cp = (oi.get("competitive_profile") or {}) if oi else {}
+    if cp.get("dentists_sampled") or comp.get("dentists_sampled"):
+        n = int(cp.get("dentists_sampled") or comp.get("dentists_sampled") or 0)
+        radius = int(cp.get("radius_used_miles") or comp.get("search_radius_used_miles") or 2)
+        avg_reviews = cp.get("avg_reviews") if (cp.get("avg_reviews") is not None) else comp.get("avg_review_count")
+        avg_rating_val = cp.get("avg_rating") if (cp.get("avg_rating") is not None and cp.get("avg_rating") != 0) else comp.get("avg_rating")
+        market_density = (cp.get("market_density") or comp.get("market_density_score") or "—").strip()
+        lead_reviews = int(comp.get("lead_review_count") or rc or 0)
+        lead_rating = rt
+        review_tier = (cp.get("review_tier") or comp.get("review_positioning_tier") or "—").strip()
+        nearest = cp.get("nearest_competitors") or (comp.get("competitor_summary") or {}).get("nearest_competitors") or []
+        if n or radius is not None:
+            vm["competitive_context"]["line1"] = (
+                f"{n} dentists sampled within {radius} mi · "
+                + (f"Avg reviews {float(avg_reviews):.0f}" if avg_reviews is not None else "Avg reviews —")
+                + " · "
+                + (f"Avg rating {float(avg_rating_val):.1f}" if avg_rating_val is not None and avg_rating_val != 0 else "Avg rating —")
+                + f" · Density {market_density}"
+            )
+        vm["competitive_context"]["line2"] = (
+            f"Lead: {lead_reviews} reviews" + (f" ({lead_rating})" if lead_rating is not None else "") + f" · Tier: {review_tier}"
+        )
+        if nearest:
+            parts = []
+            for c in nearest[:3]:
+                name = (c.get("name") or "").strip() or "—"
+                revs = c.get("reviews") or c.get("user_ratings_total") or 0
+                dist = c.get("distance_miles")
+                if dist is not None:
+                    parts.append(f"{name} — {revs} reviews — {dist} mi")
+                else:
+                    parts.append(f"{name} — {revs} reviews")
+            if parts:
+                vm["competitive_context"]["line3"] = "Nearest competitors: " + "; ".join(parts)
+
+    # ---------- 2c) Competitive Service Gap (objective_intelligence.competitive_service_gap) ----------
+    gap_block = oi.get("competitive_service_gap") if oi else None
+    if gap_block and isinstance(gap_block, dict) and gap_block.get("service"):
+        vm["competitive_service_gap"] = gap_block
+
+    # ---------- 2d) Strategic Gap (objective_intelligence.strategic_gap) ----------
+    strat = oi.get("strategic_gap") if oi else None
+    if strat and isinstance(strat, dict) and strat.get("service"):
+        vm["strategic_gap"] = strat
+
+    # ---------- 3) Demand Signals (minimal, factual, deterministic) ----------
+    channels = signals.get("signal_paid_ads_channels") or []
+    if not isinstance(channels, list):
+        channels = [channels] if channels else []
+    channels_lower = [str(c).strip().lower() for c in channels if c]
+    runs_google = signals.get("signal_runs_paid_ads") is True and "google" in channels_lower
+    runs_meta = "meta" in channels_lower
+    vm["demand_signals"]["google_ads_line"] = (
+        "Active (Search campaigns detected)" if runs_google else "Not detected"
+    )
+    vm["demand_signals"]["meta_ads_line"] = "Active" if runs_meta else "Not detected"
+    traffic_range = rev.get("traffic_estimate_range")
+    if isinstance(traffic_range, dict):
+        lo = traffic_range.get("lower") or traffic_range.get("low")
+        hi = traffic_range.get("upper") or traffic_range.get("high")
+        if lo is not None and hi is not None:
+            vm["demand_signals"]["estimated_traffic"] = f"{lo}–{hi}"
+    if not vm["demand_signals"].get("estimated_traffic"):
+        traffic_monthly = rev.get("traffic_estimate_monthly")
+        if not traffic_monthly and s60 and s60.get("traffic_estimate"):
+            traffic_monthly = (s60["traffic_estimate"] or {}).get("traffic_estimate_monthly")
+        if isinstance(traffic_monthly, dict):
+            lo, hi = traffic_monthly.get("lower"), traffic_monthly.get("upper")
+            if lo is not None and hi is not None:
+                vm["demand_signals"]["estimated_traffic"] = f"{lo}–{hi}"
+    last_rev = lead.get("days_since_last_review")
+    if last_rev is None:
+        last_rev = signals.get("signal_last_review_days_ago")
+    if last_rev is not None:
+        vm["demand_signals"]["last_review_days_ago"] = last_rev
+    vel = lead.get("review_velocity_last_30_days")
+    if vel is None:
+        vel = signals.get("signal_review_velocity_30d")
+    if vel is not None:
+        vm["demand_signals"]["review_velocity_30d"] = vel
+
+    # ---------- 4) High-Ticket Capture Gaps (canonical normalization) ----------
+    svc = obj.get("service_intelligence") or {}
+    high_ticket_raw = svc.get("high_ticket_procedures_detected")
+    missing_raw = svc.get("missing_high_value_pages")
+    detected_canonical, missing_canonical = _normalize_to_canonical_services(
+        high_ticket_raw if isinstance(high_ticket_raw, list) else [],
+        missing_raw if isinstance(missing_raw, list) else [],
+    )
+    if detected_canonical:
+        vm["high_ticket_gaps"]["high_ticket_services_detected"] = detected_canonical
+    if missing_canonical:
+        vm["high_ticket_gaps"]["missing_landing_pages"] = missing_canonical
+    schema = signals.get("signal_has_schema_microdata")
+    if schema is not None:
+        vm["high_ticket_gaps"]["schema"] = "Detected" if schema is True else "Not detected"
+    if svc.get("service_level_upside") and isinstance(svc["service_level_upside"], list):
+        vm["high_ticket_gaps"]["service_level_upside"] = svc["service_level_upside"]
+    else:
+        vm["high_ticket_gaps"]["service_level_upside_available"] = False
+
+    # ---------- 4b) Modeled Revenue Upside — {Primary Service} Capture Gap (deterministic, dental) ----------
+    missing_from_oi = (oi.get("service_intel") or {}).get("missing_high_value_pages") if oi else []
+    missing_list = list(missing_from_oi) if isinstance(missing_from_oi, list) and missing_from_oi else (list(missing_raw) if isinstance(missing_raw, list) else [])
+    if missing_list and rev:
+        primary = _primary_service_from_missing(missing_list)
+        if primary:
+            key, display_name = primary
+            tier = (rev.get("traffic_estimate_tier") or "").strip()
+            consult_low, consult_high = TRAFFIC_TIER_CONSULTS.get(tier, DEFAULT_CONSULTS)
+            case_low, case_high = PRIMARY_SERVICE_CASE_VALUE.get(key, DEFAULT_CASE_VALUE)
+            annual_low = round((consult_low * case_low * 12) / 1000) * 1000
+            annual_high = round((consult_high * case_high * 12) / 1000) * 1000
+
+            # Cap annual_high at 30% of revenue band upper; scale annual_low proportionally
+            band = rev.get("revenue_band_estimate")
+            if isinstance(band, dict) and band.get("upper") is not None:
+                try:
+                    revenue_upper = float(band["upper"])
+                    max_allowed = revenue_upper * 0.30
+                    if annual_high > max_allowed:
+                        scale = max_allowed / annual_high if annual_high > 0 else 1.0
+                        annual_low = round((annual_low * scale) / 1000) * 1000
+                        annual_high = round(max_allowed / 1000) * 1000
+                except (TypeError, ValueError):
+                    pass
+
+            annual_low = min(annual_low, annual_high)  # ensure annual_low <= annual_high
+            vm["revenue_upside_capture_gap"] = {
+                "primary_service": display_name,
+                "consult_low": consult_low,
+                "consult_high": consult_high,
+                "case_low": case_low,
+                "case_high": case_high,
+                "annual_low": annual_low,
+                "annual_high": annual_high,
+            }
+
+    # ---------- 5) Conversion Infrastructure ----------
+    vm["conversion_infrastructure"]["online_booking"] = (
+        signals.get("signal_has_automated_scheduling") is True
+        or (signals.get("signal_booking_conversion_path") or "").startswith("Online booking")
+    )
+    vm["conversion_infrastructure"]["contact_form"] = signals.get("signal_has_contact_form") is True
+    vm["conversion_infrastructure"]["phone_prominent"] = signals.get("signal_has_phone") is True
+    vm["conversion_infrastructure"]["mobile_optimized"] = signals.get("signal_mobile_friendly") is True
+    page_load = signals.get("signal_page_load_time_ms")
+    if page_load is not None:
+        vm["conversion_infrastructure"]["page_load_ms"] = page_load
+
+    # ---------- 6) Risk Flags (prefer objective_intelligence.cost_leakage_signals, then rev, s60) ----------
+    cost_leakage = (oi.get("cost_leakage_signals") or []) if oi else []
+    if not cost_leakage:
+        cost_leakage = rev.get("cost_leakage_signals")
+    if not cost_leakage and s60:
+        cost_leakage = s60.get("cost_leakage_signals")
+    primary_risks = lead.get("primary_risks") or []
+    agency_fit = profile.get("agency_fit_reasoning") or {}
+    risk_flags = agency_fit.get("risk_flags") or []
+    vm["risk_flags"] = _dedupe_risks_preserve_order(cost_leakage or [], primary_risks, risk_flags)
+
+    # ---------- 7) Intervention Plan (prefer objective_intelligence.intervention_plan; max 3 steps) ----------
+    plan_oi = (oi.get("intervention_plan") or []) if oi else []
+    steps = []
+    if plan_oi and isinstance(plan_oi, list):
+        for item in plan_oi[:3]:
+            if not isinstance(item, dict):
+                continue
+            step_num = item.get("step")
+            cat = item.get("category") or "Capture"
+            action = (item.get("action") or "").strip()
+            days = item.get("time_to_signal_days")
+            if action:
+                part = f"Step {step_num} — {cat}: {action}"
+                if days is not None:
+                    part += f" (Time to signal: {days}d)"
+                steps.append(part)
+    if not steps:
+        plan = obj.get("intervention_plan") if obj else None
+        if plan and isinstance(plan, list) and len(plan) > 0:
+            for item in plan:
+                if not isinstance(item, dict):
+                    continue
+                prio = item.get("priority")
+                cat = item.get("category")
+                action = item.get("action")
+                days = item.get("time_to_signal_days")
+                if action:
+                    part = f"Step {prio} — {cat}: {action}"
+                    if days is not None:
+                        part += f" (Time to signal: {days}d)"
+                    steps.append(part)
+    if steps:
+        # Dental only: dynamically calibrate Step 3 based on Paid Demand Status
+        if _is_dental_for_brief(lead) and len(steps) >= 3:
+            paid_status = compute_paid_demand_status(lead)
+            status = (paid_status or {}).get("status", "Inactive")
+            if status in ("Active (Search)", "Active (Search + Meta)", "Aggressive Search Presence"):
+                step3 = "Step 3 — Paid Alignment: Align Google Ads traffic to service-specific landing page and verify conversion tracking integrity."
+            else:
+                step3 = "Step 3 — Demand Activation: Launch controlled paid search test targeting high-intent service keywords."
+            steps = steps[:2] + [step3]
+        vm["intervention_plan"] = steps
+    else:
+        # Fallback: Strategic Frame + Tactical Levers
+        primary_lev = vm["executive_diagnosis"].get("primary_leverage") or "High-ticket capture"
+        tactical_parts = []
+        if missing_canonical:
+            tactical_parts.append("missing pages: " + ", ".join(missing_canonical))
+        tactical_parts.append("Schema: " + ("Detected" if schema is True else "Not detected"))
+        vm["intervention_fallback"] = {
+            "strategic_frame": f"Increase revenue via {primary_lev}.",
+            "tactical_levers": " ".join(tactical_parts) if tactical_parts else "—",
+        }
+
+    # ---------- 8) Evidence (collapsible; prefer objective_intelligence.root_constraint.evidence) ----------
+    evidence_list = []
+    if rc is not None and avg is not None:
+        evidence_list.append(f"Reviews: {rc} vs local avg {avg}")
+    schema_txt = "Detected" if schema is True else "Not detected"
+    evidence_list.append(f"Schema: {schema_txt}")
+    evidence_from_oi = (rc_oi.get("evidence") or []) if isinstance(rc_oi.get("evidence"), list) else []
+    for e in evidence_from_oi[:5]:
+        if isinstance(e, str) and e.strip():
+            evidence_list.append(e.strip())
+    if not evidence_from_oi:
+        rbc = (obj.get("root_bottleneck_classification") or {}) if obj else {}
+        rbc_evidence = (rbc.get("evidence") or []) if isinstance(rbc.get("evidence"), list) else []
+        for e in rbc_evidence[:5]:
+            if isinstance(e, str) and e.strip():
+                evidence_list.append(e.strip())
+    for e in _flatten_supporting_evidence(s60, max_items=5):
+        evidence_list.append(e)
+    vm["evidence_bullets"] = _dedupe_evidence(evidence_list, max_items=12)
+
+    return vm
+
+
+def render_revenue_brief_html(lead: Dict[str, Any], title: str = "Revenue Intelligence Brief") -> str:
+    """Render the Revenue Intelligence Brief as HTML. Deterministic; no LLM."""
+    vm = build_revenue_brief_view_model(lead)
+    sections = []
+
+    # 1) Executive Diagnosis
+    ed = vm.get("executive_diagnosis") or {}
+    footnote = vm.get("executive_footnote") or ""
+    if ed or footnote:
+        parts = []
+        if ed.get("constraint"):
+            parts.append(f"<p><strong>Constraint:</strong> {_h(ed['constraint'])}</p>")
+        if ed.get("primary_leverage"):
+            parts.append(f"<p><strong>Primary Leverage:</strong> {_h(ed['primary_leverage'])}</p>")
+        opp = ed.get("opportunity_profile")
+        if opp and isinstance(opp, dict) and opp.get("label") and opp.get("why"):
+            parts.append(f"<p><strong>Opportunity Profile:</strong> {_h(opp['label'])} <em>({_h(opp['why'])})</em></p>")
+        if ed.get("modeled_revenue_upside"):
+            parts.append(f"<p><strong>Modeled Revenue Upside:</strong> <strong>{_h(ed['modeled_revenue_upside'])}</strong></p>")
+        if footnote:
+            parts.append(f"<p class=\"brief-footnote\"><small>{_h(footnote)}</small></p>")
+        if parts:
+            sections.append(
+                "<section class=\"brief-section brief-executive\">\n  <h2>Executive Diagnosis</h2>\n  "
+                + "\n  ".join(parts)
+                + "\n</section>"
+            )
+
+    # 2) Market Position
+    mp = vm.get("market_position") or {}
+    if mp:
+        parts = []
+        if mp.get("revenue_band"):
+            parts.append(f"<p><strong>Revenue Band:</strong> {_h(mp['revenue_band'])}</p>")
+        if mp.get("reviews"):
+            parts.append(f"<p><strong>Reviews:</strong> {_h(mp['reviews'])}</p>")
+        if mp.get("local_avg"):
+            parts.append(f"<p><strong>Local Avg:</strong> {_h(mp['local_avg'])}</p>")
+        if mp.get("market_density"):
+            parts.append(f"<p><strong>Market Density:</strong> {_h(mp['market_density'])}</p>")
+        if parts:
+            sections.append(
+                "<section class=\"brief-section brief-market\">\n  <h2>Market Position</h2>\n  "
+                + "\n  ".join(parts)
+                + "\n</section>"
+            )
+
+    # 2b) Competitive Context (local SEO: dentists sampled, lead vs competitors, nearest 3)
+    cc = vm.get("competitive_context") or {}
+    if cc.get("line1") or cc.get("line2") or cc.get("line3"):
+        parts = []
+        if cc.get("line1"):
+            parts.append(f"<p>{_h(cc['line1'])}</p>")
+        if cc.get("line2"):
+            parts.append(f"<p>{_h(cc['line2'])}</p>")
+        if cc.get("line3"):
+            parts.append(f"<p>{_h(cc['line3'])}</p>")
+        if parts:
+            sections.append(
+                "<section class=\"brief-section brief-competitive\">\n  <h2>Competitive Context</h2>\n  "
+                + "\n  ".join(parts)
+                + "\n</section>"
+            )
+
+    # 2c) Competitive Service Gap (high-margin capture gap vs nearest competitor)
+    gap_block = vm.get("competitive_service_gap")
+    if gap_block and isinstance(gap_block, dict):
+        g_type = gap_block.get("type") or "High-Margin Capture Gap"
+        g_service = gap_block.get("service") or "—"
+        g_competitor = gap_block.get("competitor_name") or "—"
+        g_comp_reviews = gap_block.get("competitor_reviews")
+        g_lead_reviews = gap_block.get("lead_reviews")
+        g_dist = gap_block.get("distance_miles")
+        parts = [f"<p><strong>Type:</strong> {_h(g_type)}</p>", f"<p><strong>Service:</strong> {_h(g_service)}</p>", f"<p><strong>Nearest competitor:</strong> {_h(g_competitor)}"]
+        if g_comp_reviews is not None:
+            parts.append(f"<p><strong>Competitor reviews:</strong> {_h(g_comp_reviews)}</p>")
+        if g_lead_reviews is not None:
+            parts.append(f"<p><strong>Lead reviews:</strong> {_h(g_lead_reviews)}</p>")
+        if g_dist is not None:
+            parts.append(f"<p><strong>Distance:</strong> {_h(g_dist)} mi</p>")
+        if gap_block.get("schema_missing"):
+            parts.append(f"<p><strong>Schema:</strong> Missing</p>")
+        sections.append(
+            "<section class=\"brief-section brief-service-gap\">\n  <h2>Competitive Service Gap</h2>\n  "
+            + "\n  ".join(parts)
+            + "\n</section>"
+        )
+
+    # 3) Demand Signals (minimal, factual; omit if all data missing)
+    ds = vm.get("demand_signals") or {}
+    ds_parts = []
+    if ds.get("google_ads_line"):
+        ds_parts.append(f"<p><strong>Google Ads:</strong> {_h(ds['google_ads_line'])}</p>")
+    if ds.get("meta_ads_line"):
+        ds_parts.append(f"<p><strong>Meta Ads:</strong> {_h(ds['meta_ads_line'])}</p>")
+    if ds.get("estimated_traffic"):
+        ds_parts.append(f"<p><strong>Estimated Traffic:</strong> {_h(ds['estimated_traffic'])}</p>")
+    if ds.get("last_review_days_ago") is not None:
+        ds_parts.append(f"<p><strong>Last Review:</strong> {_h(ds['last_review_days_ago'])} days ago</p>")
+    if ds.get("review_velocity_30d") is not None:
+        ds_parts.append(f"<p><strong>Review Velocity:</strong> {_h(ds['review_velocity_30d'])} in last 30 days</p>")
+    if ds_parts:
+        sections.append(
+            "<section class=\"brief-section brief-demand\">\n  <h2>Demand Signals</h2>\n  "
+            + "\n  ".join(ds_parts)
+            + "\n</section>"
+        )
+
+    # 4) Local SEO & High-Value Service Pages (schema, GBP, service pages; revenue only in Executive Diagnosis)
+    ht = vm.get("high_ticket_gaps") or {}
+    if ht:
+        parts = []
+        if ht.get("high_ticket_services_detected"):
+            items = " ".join(f"<li>{_h(x)}</li>" for x in ht["high_ticket_services_detected"])
+            parts.append(f"<p><strong>High-value services detected:</strong></p><ul>{items}</ul>")
+        if ht.get("missing_landing_pages"):
+            items = " ".join(f"<li>{_h(x)}</li>" for x in ht["missing_landing_pages"])
+            parts.append(f"<p><strong>Missing service/landing pages:</strong></p><ul>{items}</ul>")
+        if "schema" in ht:
+            parts.append(f"<p><strong>Schema:</strong> {_h(ht['schema'])}</p>")
+        if ht.get("service_level_upside"):
+            items = " ".join(
+                f"<li>{_h(x.get('service', x) if isinstance(x, dict) else x)}: {_h(x.get('upside', ''))}</li>"
+                for x in ht["service_level_upside"][:10]
+            )
+            parts.append("<details><summary>View Modeled Upside by Service</summary><ul>" + items + "</ul></details>")
+        if parts:
+            sections.append(
+                "<section class=\"brief-section brief-highticket\">\n  <h2>Local SEO & High-Value Service Pages</h2>\n  "
+                + "\n  ".join(parts)
+                + "\n</section>"
+            )
+
+    # 4a) Modeled Revenue Upside — {Primary Service} Capture Gap (only when missing pages + revenue_intelligence)
+    rucg = vm.get("revenue_upside_capture_gap")
+    if rucg and isinstance(rucg, dict) and rucg.get("primary_service"):
+        svc_label = _h(rucg.get("primary_service") or "Service")
+        c_lo = rucg.get("consult_low", 1)
+        c_hi = rucg.get("consult_high", 4)
+        case_lo = rucg.get("case_low", 2500)
+        case_hi = rucg.get("case_high", 4000)
+        a_lo = rucg.get("annual_low", 0)
+        a_hi = rucg.get("annual_high", 0)
+        parts = [
+            f"<p>{c_lo}–{c_hi} additional consults/month</p>",
+            f"<p>${case_lo:,}–${case_hi:,} per case</p>",
+            f"<p><strong>${a_lo:,}–${a_hi:,} annually</strong></p>",
+            "<p class=\"brief-footnote\"><small>Modeled from public proxy signals; not GA4 or Ads platform data.</small></p>",
+        ]
+        sections.append(
+            "<section class=\"brief-section brief-revenue-capture-gap\">\n  "
+            f"<h2>Modeled Revenue Upside — {svc_label} Capture Gap</h2>\n  "
+            + "\n  ".join(parts)
+            + "\n</section>"
+        )
+
+    # 4b) Strategic Gap Identified (only when objective_intelligence.strategic_gap exists)
+    sg = vm.get("strategic_gap")
+    if sg and isinstance(sg, dict) and sg.get("competitor_name"):
+        cname = _h(sg.get("competitor_name") or "—")
+        crev = sg.get("competitor_reviews")
+        dist = sg.get("distance_miles")
+        md = _h(sg.get("market_density") or "High")
+        parts = [
+            f"<p>Nearest competitor {cname} holds {_h(crev) if crev is not None else '—'} reviews within {_h(dist) if dist is not None else '—'} miles.</p>",
+            "<p>This practice offers high-ticket services but lacks dedicated service pages and/or schema support.</p>",
+            f"<p>Capture gap identified in a high-margin service category within a {md} density market.</p>",
+        ]
+        sections.append(
+            "<section class=\"brief-section brief-strategic-gap\">\n  <h2>Strategic Gap Identified</h2>\n  "
+            + "\n  ".join(parts)
+            + "\n</section>"
+        )
+
+    # 5) Conversion Infrastructure
+    ci = vm.get("conversion_infrastructure") or {}
+    if ci:
+        parts = [
+            f"<p><strong>Online Booking:</strong> {'Yes' if ci.get('online_booking') else 'No'}</p>",
+            f"<p><strong>Contact Form:</strong> {'Yes' if ci.get('contact_form') else 'No'}</p>",
+            f"<p><strong>Phone Prominent:</strong> {'Yes' if ci.get('phone_prominent') else 'No'}</p>",
+            f"<p><strong>Mobile Optimized:</strong> {'Yes' if ci.get('mobile_optimized') else 'No'}</p>",
+        ]
+        if ci.get("page_load_ms") is not None:
+            parts.append(f"<p><strong>Page Load:</strong> {_h(ci['page_load_ms'])} ms</p>")
+        sections.append(
+            "<section class=\"brief-section brief-conversion\">\n  <h2>Conversion Infrastructure</h2>\n  "
+            + "\n  ".join(parts)
+            + "\n</section>"
+        )
+
+    # 6) Risk Flags
+    risks = vm.get("risk_flags") or []
+    if risks:
+        items = " ".join(f"<li>{_h(r)}</li>" for r in risks[:15])
+        sections.append(
+            "<section class=\"brief-section brief-risks\">\n  <h2>⚠ Risk Flags</h2>\n  <ul>" + items + "</ul>\n</section>"
+        )
+
+    # 7) Intervention Plan (3 steps) — no Recommended Call Positioning when plan present
+    plan = vm.get("intervention_plan") or []
+    fallback = vm.get("intervention_fallback")
+    if plan:
+        items = " ".join(f"<li>{_h(p)}</li>" for p in plan)
+        sections.append(
+            "<section class=\"brief-section brief-intervention\">\n  <h2>Intervention Plan (3 steps)</h2>\n  <ul>" + items + "</ul>\n</section>"
+        )
+    elif fallback and isinstance(fallback, dict):
+        parts = []
+        if fallback.get("strategic_frame"):
+            parts.append(f"<p><strong>Strategic Frame:</strong> {_h(fallback['strategic_frame'])}</p>")
+        if fallback.get("tactical_levers"):
+            parts.append(f"<p><strong>Tactical Levers:</strong> {_h(fallback['tactical_levers'])}</p>")
+        if parts:
+            sections.append(
+                "<section class=\"brief-section brief-intervention\">\n  <h2>Intervention Plan</h2>\n  "
+                + "\n  ".join(parts)
+                + "\n</section>"
+            )
+
+    # 8) Evidence (collapsible)
+    evidence = vm.get("evidence_bullets") or []
+    if evidence:
+        items = " ".join(f"<li>{_h(e)}</li>" for e in evidence)
+        sections.append(
+            "<section class=\"brief-section brief-evidence\">\n  <details>\n    <summary>Evidence (click)</summary>\n    <ul>"
+            + items
+            + "</ul>\n  </details>\n</section>"
+        )
+
+    body = "\n".join(sections)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{_h(title)}</title>
+  <style>
+    .revenue-brief {{ max-width: 720px; margin: 0 auto; font-family: system-ui, sans-serif; line-height: 1.5; color: #1a1a1a; }}
+    .revenue-brief .brief-section {{ margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid #e5e5e5; }}
+    .revenue-brief .brief-executive {{ border-bottom-width: 2px; padding-bottom: 1.25rem; }}
+    .revenue-brief h2 {{ font-size: 1rem; text-transform: uppercase; letter-spacing: 0.05em; color: #555; margin-bottom: 0.5rem; }}
+    .revenue-brief p {{ margin: 0.25rem 0; }}
+    .revenue-brief ul {{ margin: 0.25rem 0; padding-left: 1.25rem; }}
+    .revenue-brief .brief-footnote {{ color: #666; font-size: 0.875rem; margin-top: 0.5rem; }}
+    .revenue-brief details {{ margin-top: 0.5rem; }}
+    .revenue-brief details summary {{ cursor: pointer; font-weight: 600; }}
+  </style>
+</head>
+<body class="revenue-brief">
+  <h1>{_h(title)}</h1>
+  {body}
+</body>
+</html>"""
+
+
+def _h(s: Any) -> str:
+    """Escape for HTML text content."""
+    if s is None:
+        return ""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")

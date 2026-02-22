@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
-Small-scale test pipeline for development and testing.
+Small-scale test pipeline for dentist vertical (SEO agency opportunity intelligence).
 
-Runs the FULL pipeline with minimal API calls:
-1. Fetch nearby places (1 search)
+Runs the FULL pipeline with minimal API calls (same stack as full pipeline):
+1. Fetch nearby dental practices (1 search)
 2. Normalize & deduplicate
-3. Enrich with Place Details (3 leads)
+3. Enrich with Place Details
 4. Extract signals
-5. Score leads (NEW)
-6. Save results
+5. Decision Agent (verdict + reasoning)
+6. Dentist vertical: dentist_profile_v1 + LLM reasoning layer (for dental leads only)
+7. Objective decision layer, revenue_intelligence (traffic v3, revenue v2), agency_decision_v1 (canonical summary_60s)
+8. Optional: USE_LLM_NARRATOR=1 for narrative lines from canonical summary
+9. Save results (metadata + leads with signals, objective_decision_layer, revenue_intelligence, agency_decision_v1)
 
-Expected API calls: ~4 total
+Expected API calls: ~6 total (1 search + 5 Place Details)
 - 1 Nearby Search call (~$0.032)
-- 3 Place Details calls (~$0.024)
-Total cost: ~$0.06
+- 5 Place Details calls (~$0.04)
+Total cost: ~$0.07
 
 Usage:
     export GOOGLE_PLACES_API_KEY="your-api-key"
+    export OPENAI_API_KEY="your-openai-key"   # optional, for review summary + dentist LLM
+    ENABLE_NARRATOR=true python scripts/test_small.py   # optional narrator
     python scripts/test_small.py
 """
 
@@ -29,11 +34,44 @@ from datetime import datetime
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load .env so GOOGLE_PLACES_API_KEY and OPENAI_API_KEY work without exporting in every shell
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+except ImportError:
+    pass
+
 from pipeline.fetch import PlacesFetcher
 from pipeline.normalize import normalize_place, deduplicate_places
 from pipeline.enrich import PlaceDetailsEnricher
 from pipeline.signals import extract_signals, merge_signals_into_lead
-from pipeline.score import score_lead, get_scoring_summary
+from pipeline.meta_ads import get_meta_access_token, augment_lead_with_meta_ads
+from pipeline.semantic_signals import build_semantic_signals
+from pipeline.decision_agent import DecisionAgent
+from pipeline.context import build_context
+from pipeline.dentist_profile import (
+    is_dental_practice,
+    build_dentist_profile_v1,
+    fetch_website_html_for_trust,
+)
+from pipeline.dentist_llm_reasoning import dentist_llm_reasoning_layer
+from pipeline.sales_intervention import build_sales_intervention_intelligence
+from pipeline.objective_decision_layer import compute_objective_decision_layer
+from pipeline.service_depth import build_service_intelligence
+from pipeline.competitor_sampling import fetch_competitors_nearby, build_competitive_snapshot
+from pipeline.objective_intelligence import build_objective_intelligence, build_objective_intelligence_summary
+from pipeline.sixty_second_summary import build_sixty_second_summary
+from pipeline.revenue_intelligence import build_revenue_intelligence
+from pipeline.canonical_decision_model import build_canonical_summary_v1
+from pipeline.agency_decision import build_agency_decision_v1
+from pipeline.llm_structured_extraction import extract_structured
+from pipeline.llm_executive_compression import build_executive_summary_and_outreach
+from pipeline.llm_narrator import narrate_from_canonical
+from pipeline.service_depth import get_page_texts_for_llm
+from pipeline.db import init_db, create_run, insert_lead, insert_lead_signals
+from pipeline.db import get_lead_embedding_v2, insert_lead_embedding_v2
+from pipeline.embedding_snapshot import build_embedding_snapshot_v1
+from pipeline.embeddings import get_embedding
 
 # Configure logging
 logging.basicConfig(
@@ -44,34 +82,34 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# MINIMAL TEST CONFIGURATION
+# DENTIST TEST CONFIGURATION
 # ============================================================================
 
 TEST_CONFIG = {
-    # Location: San Jose city center
+    # Location: San Jose city center (good dental density)
     "lat": 37.3382,
     "lng": -121.8863,
     "radius_m": 2000,  # 2km radius
     
-    # Single keyword
-    "keyword": "HVAC",
+    # Dentist-specific keyword (Google Places returns dental practices)
+    "keyword": "dentist",
     
     # Limits
     "max_pages": 1,      # Only first page (20 results max)
-    "max_leads": 3,      # Only enrich 3 leads
+    "max_leads": 5,     # Enrich 5 leads to get a few dental practices
     
     # Output
-    "output_file": "output/test_small_results.json"
+    "output_file": "output/test_small_results_dentist.json"
 }
 
 
 def run_small_test():
     """Run minimal pipeline test."""
     logger.info("=" * 60)
-    logger.info("SMALL-SCALE PIPELINE TEST")
+    logger.info("DENTIST PIPELINE TEST (small-scale)")
     logger.info("=" * 60)
-    logger.info(f"Expected API calls: ~4")
-    logger.info(f"Expected cost: ~$0.06")
+    logger.info(f"Keyword: {TEST_CONFIG['keyword']} | Max leads: {TEST_CONFIG['max_leads']}")
+    logger.info(f"Expected API calls: ~{1 + TEST_CONFIG['max_leads']} (1 search + {TEST_CONFIG['max_leads']} Place Details)")
     logger.info("=" * 60)
     
     # Check API key
@@ -102,7 +140,11 @@ def run_small_test():
     logger.info(f"  Results fetched: {len(raw_places)}")
     
     if not raw_places:
-        logger.error("No places found! Check API key and location.")
+        logger.error(
+            "No places found! Common causes: (1) GOOGLE_PLACES_API_KEY missing or wrong in this shell "
+            "or .env, (2) Places API not enabled or billing not set in Google Cloud, (3) Key restrictions "
+            "blocking this environment. Check any WARNING above for API status."
+        )
         sys.exit(1)
     
     # =========================================
@@ -147,9 +189,13 @@ def run_small_test():
     logger.info("\n[Step 4] Extracting signals...")
     
     final_leads = []
+    if get_meta_access_token():
+        logger.info("  (META_ACCESS_TOKEN set — will augment with Meta Ads Library)")
     for lead in enriched_leads:
         signals = extract_signals(lead)
         merged = merge_signals_into_lead(lead, signals)
+        if get_meta_access_token():
+            augment_lead_with_meta_ads(merged)
         final_leads.append(merged)
         
         logger.info(f"  ✓ {lead['name'][:40]}")
@@ -157,39 +203,237 @@ def run_small_test():
         logger.info(f"    📝 Contact Form: {signals.get('has_contact_form')} | Email: {signals.get('has_email')}")
         logger.info(f"    ⚙️ Auto-scheduling: {signals.get('has_automated_scheduling')} | Trust: {signals.get('has_trust_badges')}")
         logger.info(f"    ⭐ Rating: {signals.get('rating')} | Reviews: {signals.get('review_count')}")
+        if get_meta_access_token():
+            meta_info = merged.get("signal_meta_ads_count")
+            if meta_info is not None:
+                logger.info(f"    📢 Meta Ads: %s ad(s) in library", meta_info)
+            elif merged.get("signal_meta_ads_source"):
+                logger.info(f"    📢 Meta Ads: checked (meta_ads_library)")
+            else:
+                logger.info(f"    📢 Meta Ads: checked — none in library for US")
     
     # =========================================
-    # Step 5: Score leads
+    # Step 5: Decision Agent for non-dental leads (semantic signals); dental leads get decision after objective_intelligence in Step 6
     # =========================================
-    logger.info("\n[Step 5] Scoring leads...")
-    
-    scored_leads = []
+    agency_type = os.getenv("AGENCY_TYPE", "marketing").lower() or "marketing"
+    if agency_type not in ("seo", "marketing"):
+        agency_type = "marketing"
+    logger.info("\n[Step 5] Decision Agent for non-dental leads (agency_type=%s)...", agency_type)
+    agent = DecisionAgent(agency_type=agency_type)
+
+    def _store_decision(lead: dict, decision, atype: str) -> None:
+        lead["decision_agent_v1"] = {
+            "verdict": decision.verdict,
+            "confidence": decision.confidence,
+            "reasoning": decision.reasoning,
+            "primary_risks": decision.primary_risks,
+            "what_would_change": decision.what_would_change,
+        }
+        lead["verdict"] = decision.verdict
+        lead["confidence"] = decision.confidence
+        lead["reasoning"] = decision.reasoning
+        lead["primary_risks"] = decision.primary_risks
+        lead["what_would_change"] = decision.what_would_change
+        lead["agency_type"] = atype
+
     for lead in final_leads:
-        result = score_lead(lead)
-        lead["lead_score"] = result.lead_score
-        lead["priority"] = result.priority
-        lead["confidence"] = result.confidence
-        lead["reasons"] = result.reasons
-        scored_leads.append(lead)
-        
+        if is_dental_practice(lead):
+            continue
+        semantic = build_semantic_signals(lead)
+        decision = agent.decide(semantic, lead_name=lead.get("name") or "")
+        _store_decision(lead, decision, agency_type)
         logger.info(f"  ✓ {lead['name'][:40]}")
-        logger.info(f"    Score: {result.lead_score} | Priority: {result.priority} | Confidence: {result.confidence}")
-        rs = result.review_summary
-        logger.info(f"    Reviews: {rs['review_count']} ({rs['volume']}) | Last: {rs['last_review_text']} ({rs['freshness']})")
-        logger.info(f"    Reasons: {', '.join(result.reasons[:2])}...")
-    
-    final_leads = scored_leads
+        logger.info(f"    Verdict: {decision.verdict} | Confidence: {decision.confidence}")
+        r = decision.reasoning
+        logger.info(f"    Reasoning: %s", (r[:120] + "...") if len(r) > 120 else r)
+        if decision.primary_risks:
+            logger.info(f"    Risks: %s", decision.primary_risks[:2])
+        if decision.what_would_change:
+            logger.info(f"    Would change: %s", decision.what_would_change[:2])
     
     # =========================================
-    # Step 6: Save results
+    # Step 6: Dentist vertical (profile + LLM reasoning for dental leads only)
     # =========================================
-    logger.info("\n[Step 6] Saving results...")
+    logger.info("\n[Step 6] Dentist vertical (profile + LLM for dental leads)...")
+    dentist_count = 0
+    for lead in final_leads:
+        if not is_dental_practice(lead):
+            continue
+        dentist_count += 1
+        url = lead.get("signal_website_url")
+        website_html = fetch_website_html_for_trust(url) if url else None
+        dentist_profile_v1 = build_dentist_profile_v1(lead, website_html=website_html)
+        lead["dentist_profile_v1"] = dentist_profile_v1
+        context = build_context(lead) if dentist_profile_v1 else {}
+        # Competitors -> Objective decision layer -> Revenue intelligence -> Objective intelligence -> Decision Agent
+        procedure_mentions = (dentist_profile_v1.get("review_intent_analysis") or {}).get("procedure_mentions") or []
+        service_intel = build_service_intelligence(lead.get("signal_website_url"), website_html, procedure_mentions)
+        competitors = []
+        search_radius_used_miles = 2
+        lat, lng = lead.get("latitude"), lead.get("longitude")
+        if lat is not None and lng is not None:
+            competitors, search_radius_used_miles = fetch_competitors_nearby(lat, lng, lead.get("place_id"))
+        competitive_snap = build_competitive_snapshot(lead, competitors, search_radius_used_miles) if competitors else {}
+        obj_layer = compute_objective_decision_layer(
+            lead,
+            service_intelligence=service_intel,
+            competitive_snapshot=competitive_snap if competitors else None,
+            revenue_leverage=None,
+        )
+        lead["objective_decision_layer"] = obj_layer if obj_layer else {}
+        lead["competitive_snapshot"] = competitive_snap
+        lead["service_intelligence"] = service_intel
+        dentist_profile_v1 = lead.get("dentist_profile_v1") or {}
+        page_texts = None
+        if os.getenv("USE_LLM_STRUCTURED_EXTRACTION", "").strip().lower() in ("1", "true", "yes"):
+            page_texts = get_page_texts_for_llm(lead.get("signal_website_url"), website_html)
+        pricing_page_detected = bool(page_texts and page_texts.get("pricing_page_text"))
+        rev_intel = build_revenue_intelligence(
+            lead,
+            dentist_profile_v1,
+            obj_layer or {},
+            pricing_page_detected=pricing_page_detected,
+            paid_intelligence=lead.get("paid_intelligence"),
+        )
+        lead["revenue_intelligence"] = rev_intel
+        # Objective intelligence (deterministic) -> Decision Agent (strategic verdict only)
+        oi = build_objective_intelligence(lead)
+        lead["objective_intelligence"] = oi
+        oi_summary = build_objective_intelligence_summary(oi)
+        decision = agent.decide_from_objective_summary(oi_summary, lead_name=lead.get("name") or "")
+        _store_decision(lead, decision, agency_type)
+        # LLM reasoning and sales intervention (use verdict/confidence from Decision Agent)
+        llm_layer = {}
+        if dentist_profile_v1:
+            lead_score = round((lead.get("confidence") or 0) * 100)
+            llm_layer = dentist_llm_reasoning_layer(
+                business_snapshot=lead,
+                dentist_profile_v1=dentist_profile_v1,
+                context_dimensions=context.get("context_dimensions", []),
+                lead_score=lead_score,
+                priority=lead.get("verdict"),
+                confidence=lead.get("confidence"),
+            )
+        lead["llm_reasoning_layer"] = llm_layer if llm_layer else {}
+        sales_intel = build_sales_intervention_intelligence(
+            business_snapshot=lead,
+            dentist_profile_v1=dentist_profile_v1,
+            context_dimensions=context.get("context_dimensions", []) if context else [],
+            verdict=lead.get("verdict"),
+            confidence=lead.get("confidence"),
+            llm_reasoning_layer=lead.get("llm_reasoning_layer"),
+        )
+        lead["sales_intervention_intelligence"] = sales_intel if sales_intel else {}
+        logger.info(f"  ✓ {lead['name'][:40]} (dental)")
+        if dentist_profile_v1:
+            af = dentist_profile_v1.get("agency_fit_reasoning", {})
+            logger.info(f"    ideal_for_seo_outreach=%s | LTV=%s", af.get("ideal_for_seo_outreach"), dentist_profile_v1.get("dental_practice_profile", {}).get("estimated_ltv_class"))
+        logger.info(f"    Verdict: %s | Confidence: %s", lead.get("verdict"), lead.get("confidence"))
+        if llm_layer and llm_layer.get("executive_summary"):
+            logger.info(f"    LLM summary: %s", (llm_layer["executive_summary"][:80] + "...") if len(llm_layer["executive_summary"]) > 80 else llm_layer["executive_summary"])
+        if sales_intel and sales_intel.get("primary_sales_anchor", {}).get("issue"):
+            logger.info(f"    Primary anchor: %s", (sales_intel["primary_sales_anchor"]["issue"][:60] + "...") if len(sales_intel["primary_sales_anchor"]["issue"]) > 60 else sales_intel["primary_sales_anchor"]["issue"])
+        if obj_layer and obj_layer.get("root_bottleneck_classification"):
+            seo_assess = obj_layer.get("seo_lever_assessment") or {}
+            logger.info(f"    Root bottleneck: %s | SEO primary lever: %s", obj_layer["root_bottleneck_classification"].get("bottleneck"), seo_assess.get("is_primary_growth_lever"))
+        llm_extraction = None
+        if page_texts is not None:
+            llm_extraction = extract_structured(
+                page_texts.get("homepage_text") or "",
+                page_texts.get("services_page_text"),
+                page_texts.get("pricing_page_text"),
+            )
+            lead["llm_structured_extraction"] = llm_extraction
+        # Layer B: single canonical decision object (frozen contract)
+        signals_layer = {k: v for k, v in lead.items() if k.startswith("signal_") or k in ("user_ratings_total", "verdict", "rating")}
+        canonical_summary_v1 = build_canonical_summary_v1(
+            signals_layer,
+            competitive_snap,
+            service_intel,
+            rev_intel,
+            obj_layer or {},
+        )
+        lead["canonical_summary_v1"] = canonical_summary_v1
+        narrator_optional = None
+        if os.getenv("ENABLE_NARRATOR", "").strip().lower() in ("1", "true", "yes"):
+            narrator_optional = narrate_from_canonical(canonical_summary_v1)
+        lead["narrator_optional"] = narrator_optional
+        # Internal debug: not consumed by UI
+        lead["internal_debug"] = {
+            "dentist_profile_v1": dentist_profile_v1,
+            "agency_decision_v1_deprecated": build_agency_decision_v1(lead, dentist_profile_v1, obj_layer or {}, rev_intel),
+            "sixty_second_summary": build_sixty_second_summary(lead),
+            "verdict": lead.get("verdict"),
+            "confidence": lead.get("confidence"),
+            "reasoning": lead.get("reasoning"),
+            "primary_risks": lead.get("primary_risks"),
+            "what_would_change": lead.get("what_would_change"),
+            "agency_type": lead.get("agency_type"),
+            "llm_reasoning_layer": lead.get("llm_reasoning_layer"),
+            "sales_intervention_intelligence": lead.get("sales_intervention_intelligence"),
+        }
+    logger.info(f"  Dental leads with profile: {dentist_count}/{len(final_leads)}")
+
+    # =========================================
+    # Step 6b: Optional embedding storage (STORE_EMBEDDINGS=1)
+    # =========================================
+    if os.getenv("STORE_EMBEDDINGS", "").strip().lower() in ("1", "true", "yes"):
+        logger.info("\n[Step 6b] Storing embeddings (STORE_EMBEDDINGS=1)...")
+        init_db()
+        run_id = create_run({"source": "test_small"})
+        for lead in final_leads:
+            lead_id = insert_lead(run_id, lead)
+            sig = {k: v for k, v in lead.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating")}
+            insert_lead_signals(lead_id, sig)
+            if is_dental_practice(lead) and lead.get("objective_intelligence"):
+                text = build_embedding_snapshot_v1(lead)
+                if text:
+                    try:
+                        emb = get_embedding(text)
+                        if emb and not get_lead_embedding_v2(lead_id, "v1_structural", "objective_state"):
+                            insert_lead_embedding_v2(
+                                lead_id=lead_id,
+                                embedding=emb,
+                                text=text,
+                                embedding_version="v1_structural",
+                                embedding_type="objective_state",
+                            )
+                            logger.info(f"    Stored embedding for {lead.get('name', '')[:40]}")
+                    except Exception as e:
+                        logger.warning("    Embedding failed for %s: %s", lead.get("name", ""), e)
+        logger.info("  Embedding storage complete")
+    
+    # =========================================
+    # Step 7: Save results (frozen contract)
+    # =========================================
+    logger.info("\n[Step 7] Saving results...")
     
     os.makedirs(os.path.dirname(TEST_CONFIG["output_file"]), exist_ok=True)
-    
+
+    def _to_contract_lead(l):
+        """One lead: metadata, signals, models, objective_intelligence, decision_agent_v1, canonical_summary_v1, narrator_optional, internal_debug."""
+        sig = {k: v for k, v in l.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating", "verdict")}
+        sig["competitive_snapshot"] = l.get("competitive_snapshot")
+        sig["service_intelligence"] = l.get("service_intelligence")
+        sig["paid_intelligence"] = l.get("paid_intelligence")
+        sig["revenue_intelligence"] = l.get("revenue_intelligence")
+        return {
+            "place_id": l.get("place_id"),
+            "name": l.get("name"),
+            "address": l.get("address"),
+            "signals": sig,
+            "models": l.get("objective_decision_layer"),
+            "objective_intelligence": l.get("objective_intelligence"),
+            "decision_agent_v1": l.get("decision_agent_v1"),
+            "canonical_summary_v1": l.get("canonical_summary_v1"),
+            "narrator_optional": l.get("narrator_optional"),
+            "internal_debug": l.get("internal_debug"),
+        }
+
     output_data = {
         "metadata": {
             "test_run": True,
+            "vertical": "dentist",
             "timestamp": datetime.utcnow().isoformat(),
             "api_calls": {
                 "nearby_search": fetch_stats["total_requests"],
@@ -197,12 +441,13 @@ def run_small_test():
                 "total": fetch_stats["total_requests"] + enrich_stats["total_requests"]
             },
             "estimated_cost_usd": round(
-                fetch_stats["total_requests"] * 0.032 + 
+                fetch_stats["total_requests"] * 0.032 +
                 enrich_stats["total_requests"] * 0.008,
                 4
-            )
+            ),
+            "dentist_leads_with_profile": sum(1 for l in final_leads if l.get("dentist_profile_v1")),
         },
-        "leads": final_leads
+        "leads": [_to_contract_lead(l) for l in final_leads],
     }
     
     with open(TEST_CONFIG["output_file"], 'w') as f:
@@ -221,20 +466,23 @@ def run_small_test():
     logger.info(f"Leads processed: {len(final_leads)}")
     logger.info(f"Output file: {TEST_CONFIG['output_file']}")
     
-    # Print scoring summary
+    # Print decision summary
     if final_leads:
-        summary = get_scoring_summary(final_leads)
-        logger.info(f"\nScoring Summary:")
-        logger.info(f"  Avg Score: {summary['score']['avg']}")
-        logger.info(f"  🔥 High: {summary['priority']['high']} | 🟡 Medium: {summary['priority']['medium']} | ⚪ Low: {summary['priority']['low']}")
+        worth = [l.get("canonical_summary_v1", {}).get("worth_pursuing") for l in final_leads]
+        yes = sum(1 for v in worth if v == "Yes")
+        maybe = sum(1 for v in worth if v == "Maybe")
+        no = sum(1 for v in worth if v == "No")
+        logger.info(f"\nDecision Summary (worth_pursuing):")
+        logger.info(f"  Yes=%s Maybe=%s No=%s", yes, maybe, no)
+        dentist_with_profile = sum(1 for l in final_leads if (l.get("internal_debug") or {}).get("dentist_profile_v1"))
+        logger.info(f"  Dentist profile: %s/%s leads", dentist_with_profile, len(final_leads))
     
-    # Print one full example
+    # Print one full example (contract shape)
     if final_leads:
         logger.info("\n" + "-" * 60)
-        logger.info("SAMPLE OUTPUT (first lead):")
+        logger.info("SAMPLE OUTPUT (first lead — contract)")
         logger.info("-" * 60)
-        sample = {k: v for k, v in final_leads[0].items() 
-                  if k.startswith('signal_') or k in ['place_id', 'name', 'address', 'lead_score', 'priority', 'confidence', 'reasons']}
+        sample = output_data["leads"][0]
         print(json.dumps(sample, indent=2, default=str))
     
     return final_leads

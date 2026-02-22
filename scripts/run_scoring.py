@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Lead Scoring Pipeline (Step 5)
+Opportunity Intelligence Pipeline
 
-Scores enriched leads and outputs prioritized results.
+Analyzes enriched leads for business opportunities and prioritizes them.
 
 Usage:
     python scripts/run_scoring.py
@@ -50,20 +50,19 @@ def load_leads(filepath: str) -> list:
     return data
 
 
-def save_scored_leads(leads: list, output_dir: str = "output") -> str:
-    """Save scored leads to JSON file."""
+def save_analyzed_leads(leads: list, output_dir: str = "output") -> str:
+    """Save analyzed leads to JSON file."""
     os.makedirs(output_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"scored_leads_{timestamp}.json"
     filepath = os.path.join(output_dir, filename)
     
-    # Get summary
     summary = get_scoring_summary(leads)
     
     output_data = {
         "metadata": {
-            "scored_at": datetime.utcnow().isoformat(),
+            "analyzed_at": datetime.utcnow().isoformat(),
             "total_leads": len(leads),
             "summary": summary
         },
@@ -73,14 +72,14 @@ def save_scored_leads(leads: list, output_dir: str = "output") -> str:
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
     
-    logger.info(f"Saved scored leads to: {filepath}")
+    logger.info(f"Saved analyzed leads to: {filepath}")
     return filepath
 
 
 def main():
-    """Run the scoring pipeline."""
+    """Run the opportunity intelligence pipeline."""
     logger.info("=" * 60)
-    logger.info("LEAD SCORING PIPELINE (V1)")
+    logger.info("OPPORTUNITY INTELLIGENCE PIPELINE")
     logger.info("=" * 60)
     
     # Find input file
@@ -93,65 +92,64 @@ def main():
     
     logger.info(f"Loading from: {input_file}")
     leads = load_leads(input_file)
-    logger.info(f"Found {len(leads)} leads to score")
+    logger.info(f"Found {len(leads)} leads to analyze")
     
-    # Score leads
-    logger.info("\nScoring leads...")
-    scored_leads = score_leads_batch(leads)
+    # Analyze leads
+    logger.info("\nAnalyzing opportunities...")
+    analyzed_leads = score_leads_batch(leads)
     
     # Get summary
-    summary = get_scoring_summary(scored_leads)
+    summary = get_scoring_summary(analyzed_leads)
     
     # Display summary
     logger.info("\n" + "=" * 60)
-    logger.info("SCORING SUMMARY")
+    logger.info("OPPORTUNITY INTELLIGENCE SUMMARY")
     logger.info("=" * 60)
     
-    # Score distribution buckets
-    scores = [l.get("lead_score", 0) for l in scored_leads]
-    elite_100 = sum(1 for s in scores if s == 100)
-    very_strong = sum(1 for s in scores if 95 <= s < 100)
-    strong = sum(1 for s in scores if 90 <= s < 95)
-    solid = sum(1 for s in scores if 80 <= s < 90)
-    below_80 = sum(1 for s in scores if s < 80)
+    logger.info(f"\nPriority Breakdown:")
+    logger.info(f"   High:   {summary['priority']['high']} ({summary['priority']['high_pct']}%)")
+    logger.info(f"   Medium: {summary['priority']['medium']} ({summary['priority']['medium_pct']}%)")
+    logger.info(f"   Low:    {summary['priority']['low']} ({summary['priority']['low_pct']}%)")
     
-    logger.info(f"\n📊 Score Distribution:")
-    logger.info(f"   🏆 100 (Elite):       {elite_100} ({elite_100/len(scored_leads)*100:.1f}%)")
-    logger.info(f"   ⭐ 95-99 (Very Strong): {very_strong} ({very_strong/len(scored_leads)*100:.1f}%)")
-    logger.info(f"   💪 90-94 (Strong):    {strong} ({strong/len(scored_leads)*100:.1f}%)")
-    logger.info(f"   ✓  80-89 (Solid):     {solid} ({solid/len(scored_leads)*100:.1f}%)")
-    logger.info(f"   📉 <80:               {below_80} ({below_80/len(scored_leads)*100:.1f}%)")
-    logger.info(f"\n   Average: {summary['score']['avg']} | Range: {summary['score']['min']} - {summary['score']['max']}")
+    logger.info(f"\nOpportunity Distribution:")
+    logger.info(f"   Avg per lead: {summary['opportunities']['avg_per_lead']}")
+    for opp_type, count in summary['opportunities']['by_type'].items():
+        pct = round(count / len(analyzed_leads) * 100, 1)
+        logger.info(f"   {opp_type}: {count} ({pct}%)")
     
-    logger.info(f"\n🎯 Priority Breakdown:")
-    logger.info(f"   🔥 High:   {summary['priority']['high']} ({summary['priority']['high_pct']}%)")
-    logger.info(f"   🟡 Medium: {summary['priority']['medium']} ({summary['priority']['medium_pct']}%)")
-    logger.info(f"   ⚪ Low:    {summary['priority']['low']} ({summary['priority']['low_pct']}%)")
-    
-    logger.info(f"\n📈 Confidence:")
+    logger.info(f"\nConfidence:")
     logger.info(f"   Average: {summary['confidence']['avg']}")
     logger.info(f"   Range: {summary['confidence']['min']} - {summary['confidence']['max']}")
     
-    # Save results
-    output_path = save_scored_leads(scored_leads)
+    logger.info(f"\nInternal Score (for sorting):")
+    logger.info(f"   Average: {summary['score']['avg']}")
+    logger.info(f"   Range: {summary['score']['min']} - {summary['score']['max']}")
     
-    # Show top leads
+    # Save results
+    output_path = save_analyzed_leads(analyzed_leads)
+    
+    # Show top high-priority leads
     logger.info("\n" + "=" * 60)
     logger.info("TOP 5 HIGH-PRIORITY LEADS")
     logger.info("=" * 60)
     
-    high_priority = [l for l in scored_leads if l.get("priority") == "High"]
+    high_priority = [l for l in analyzed_leads if l.get("priority") == "High"]
     high_priority.sort(key=lambda x: x.get("lead_score", 0), reverse=True)
     
     for i, lead in enumerate(high_priority[:5], 1):
         logger.info(f"\n{i}. {lead.get('name', 'Unknown')}")
-        logger.info(f"   Score: {lead.get('lead_score')} | Confidence: {lead.get('confidence')}")
+        logger.info(f"   Priority: {lead.get('priority')} | Score: {lead.get('lead_score')} | Confidence: {lead.get('confidence')}")
         logger.info(f"   Phone: {lead.get('signal_phone_number', 'N/A')}")
-        logger.info(f"   Reasons:")
-        for reason in lead.get('reasons', [])[:3]:
-            logger.info(f"     • {reason}")
+        
+        opps = lead.get("opportunities", [])
+        if opps:
+            logger.info(f"   Opportunities ({len(opps)}):")
+            for opp in opps:
+                logger.info(f"     [{opp['strength']}] {opp['type']}")
+                for ev in opp.get("evidence", [])[:2]:
+                    logger.info(f"       - {ev}")
     
-    logger.info(f"\n✓ Complete! Results saved to: {output_path}")
+    logger.info(f"\nComplete! Results saved to: {output_path}")
 
 
 if __name__ == "__main__":
