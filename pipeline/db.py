@@ -9,6 +9,7 @@ import sqlite3
 import json
 import uuid
 import logging
+from collections import Counter
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 
@@ -110,6 +111,33 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_leads_run ON leads(run_id);
             CREATE INDEX IF NOT EXISTS idx_context_lead ON context_dimensions(lead_id);
             CREATE INDEX IF NOT EXISTS idx_decisions_lead ON decisions(lead_id);
+
+            CREATE TABLE IF NOT EXISTS lead_embeddings_v2 (
+                lead_id INTEGER NOT NULL,
+                embedding_json TEXT NOT NULL,
+                text_snapshot TEXT NOT NULL,
+                embedding_version TEXT NOT NULL,
+                embedding_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (lead_id, embedding_version, embedding_type),
+                FOREIGN KEY (lead_id) REFERENCES leads(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS lead_outcomes (
+                lead_id INTEGER NOT NULL UNIQUE,
+                vertical TEXT,
+                agency_type TEXT,
+                contacted INTEGER DEFAULT 0,
+                proposal_sent INTEGER DEFAULT 0,
+                closed INTEGER DEFAULT 0,
+                close_value_usd REAL,
+                service_sold TEXT,
+                notes TEXT,
+                status TEXT,
+                updated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (lead_id) REFERENCES leads(id)
+            );
         """)
         conn.commit()
         # Optional columns (migration for existing DBs)
@@ -352,6 +380,246 @@ def insert_lead_embedding(lead_id: int, embedding: List[float], text_snapshot: s
         conn.commit()
     finally:
         conn.close()
+
+
+def insert_lead_embedding_v2(
+    lead_id: int,
+    embedding: List[float],
+    text: str,
+    embedding_version: str,
+    embedding_type: str,
+) -> None:
+    """Store embedding in lead_embeddings_v2 (versioned, typed)."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO lead_embeddings_v2
+               (lead_id, embedding_json, text_snapshot, embedding_version, embedding_type, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (lead_id, json.dumps(embedding), text[:5000], embedding_version, embedding_type, now)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_lead_embedding_v2(
+    lead_id: int,
+    embedding_version: str,
+    embedding_type: str,
+) -> Optional[Dict]:
+    """Return stored embedding row or None."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT lead_id, embedding_json, text_snapshot, embedding_version, embedding_type, created_at
+               FROM lead_embeddings_v2
+               WHERE lead_id = ? AND embedding_version = ? AND embedding_type = ?""",
+            (lead_id, embedding_version, embedding_type),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "lead_id": row["lead_id"],
+            "embedding_json": row["embedding_json"],
+            "embedding": json.loads(row["embedding_json"]) if row["embedding_json"] else [],
+            "text_snapshot": row["text_snapshot"],
+            "embedding_version": row["embedding_version"],
+            "embedding_type": row["embedding_type"],
+            "created_at": row["created_at"],
+        }
+    finally:
+        conn.close()
+
+
+def upsert_lead_outcome(
+    lead_id: int,
+    vertical: Optional[str] = None,
+    agency_type: Optional[str] = None,
+    contacted: Optional[bool] = None,
+    proposal_sent: Optional[bool] = None,
+    closed: Optional[bool] = None,
+    close_value_usd: Optional[float] = None,
+    service_sold: Optional[str] = None,
+    status: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    """Insert outcome row or update existing. Only provided fields are updated."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        existing = conn.execute(
+            "SELECT lead_id FROM lead_outcomes WHERE lead_id = ?", (lead_id,)
+        ).fetchone()
+        if existing:
+            updates = ["updated_at = ?"]
+            params: List[Any] = [now]
+            if vertical is not None:
+                updates.append("vertical = ?")
+                params.append(vertical)
+            if agency_type is not None:
+                updates.append("agency_type = ?")
+                params.append(agency_type)
+            if contacted is not None:
+                updates.append("contacted = ?")
+                params.append(1 if contacted else 0)
+            if proposal_sent is not None:
+                updates.append("proposal_sent = ?")
+                params.append(1 if proposal_sent else 0)
+            if closed is not None:
+                updates.append("closed = ?")
+                params.append(1 if closed else 0)
+            if close_value_usd is not None:
+                updates.append("close_value_usd = ?")
+                params.append(close_value_usd)
+            if service_sold is not None:
+                updates.append("service_sold = ?")
+                params.append(service_sold)
+            if status is not None:
+                updates.append("status = ?")
+                params.append(status)
+            if notes is not None:
+                updates.append("notes = ?")
+                params.append(notes)
+            params.append(lead_id)
+            conn.execute(
+                f"UPDATE lead_outcomes SET {', '.join(updates)} WHERE lead_id = ?",
+                params,
+            )
+        else:
+            _c = 1 if contacted else 0 if contacted is not None else 0
+            _p = 1 if proposal_sent else 0 if proposal_sent is not None else 0
+            _cl = 1 if closed else 0 if closed is not None else 0
+            conn.execute(
+                """INSERT INTO lead_outcomes
+                   (lead_id, vertical, agency_type, contacted, proposal_sent, closed,
+                    close_value_usd, service_sold, notes, status, updated_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (lead_id, vertical, agency_type, _c, _p, _cl, close_value_usd,
+                 service_sold, notes, status or "new", now, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_lead_outcome(lead_id: int) -> Optional[Dict]:
+    """Return outcome row for lead or None."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT lead_id, vertical, agency_type, contacted, proposal_sent, closed,
+                      close_value_usd, service_sold, notes, status, updated_at, created_at
+               FROM lead_outcomes WHERE lead_id = ?""",
+            (lead_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def get_similar_lead_ids_v2(
+    embedding: List[float],
+    limit: int = 25,
+    embedding_version: str = "v1_structural",
+    embedding_type: str = "objective_state",
+    exclude_lead_id: Optional[int] = None,
+) -> List[tuple]:
+    """
+    Return (lead_id, similarity, text_snapshot) from lead_embeddings_v2,
+    ordered by cosine similarity. Excludes exclude_lead_id if provided.
+    """
+    conn = _get_conn()
+    try:
+        if exclude_lead_id is not None:
+            rows = conn.execute(
+                """SELECT lead_id, embedding_json, text_snapshot
+                   FROM lead_embeddings_v2
+                   WHERE embedding_version = ? AND embedding_type = ? AND lead_id != ?""",
+                (embedding_version, embedding_type, exclude_lead_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT lead_id, embedding_json, text_snapshot
+                   FROM lead_embeddings_v2
+                   WHERE embedding_version = ? AND embedding_type = ?""",
+                (embedding_version, embedding_type),
+            ).fetchall()
+        scored = []
+        for row in rows:
+            try:
+                other = json.loads(row["embedding_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            sim = _cosine_similarity(embedding, other)
+            scored.append((row["lead_id"], round(sim, 4), row["text_snapshot"] or ""))
+        scored.sort(key=lambda x: -x[1])
+        return scored[:limit]
+    finally:
+        conn.close()
+
+
+def get_similar_outcome_stats(
+    lead_embedding: List[float],
+    limit: int = 25,
+    embedding_version: str = "v1_structural",
+    embedding_type: str = "objective_state",
+) -> Dict:
+    """
+    Compute similarity-based outcome stats for similar leads.
+    Returns n_similar, n_with_outcomes, close_rate, contacted_rate, proposal_rate, top_service_sold.
+    If n_with_outcomes < 5, sets insufficient_outcomes: True.
+    """
+    similar = get_similar_lead_ids_v2(
+        lead_embedding,
+        limit=limit,
+        embedding_version=embedding_version,
+        embedding_type=embedding_type,
+    )
+    n_similar = len(similar)
+    if n_similar == 0:
+        return {"n_similar": 0, "n_with_outcomes": 0, "insufficient_outcomes": True}
+
+    lead_ids = [x[0] for x in similar]
+    placeholders = ",".join("?" * len(lead_ids))
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            f"""SELECT lead_id, contacted, proposal_sent, closed, close_value_usd, service_sold
+                FROM lead_outcomes WHERE lead_id IN ({placeholders})""",
+            lead_ids,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    n_with_outcomes = len(rows)
+    if n_with_outcomes < 5:
+        return {
+            "n_similar": n_similar,
+            "n_with_outcomes": n_with_outcomes,
+            "insufficient_outcomes": True,
+        }
+
+    contacted_count = sum(1 for r in rows if r["contacted"])
+    proposal_count = sum(1 for r in rows if r["proposal_sent"])
+    closed_count = sum(1 for r in rows if r["closed"])
+    services = [r["service_sold"] for r in rows if r["service_sold"]]
+    top_service = None
+    if services:
+        top_service = Counter(services).most_common(1)[0][0]
+
+    return {
+        "n_similar": n_similar,
+        "n_with_outcomes": n_with_outcomes,
+        "contacted_rate": round(contacted_count / n_with_outcomes, 2) if n_with_outcomes else 0,
+        "proposal_rate": round(proposal_count / n_with_outcomes, 2) if n_with_outcomes else 0,
+        "close_rate": round(closed_count / n_with_outcomes, 2) if n_with_outcomes else 0,
+        "top_service_sold": top_service,
+        "insufficient_outcomes": False,
+    }
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:

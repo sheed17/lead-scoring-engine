@@ -64,7 +64,11 @@ from pipeline.db import (
     update_lead_dentist_data,
     update_run_completed,
     update_run_failed,
+    get_lead_embedding_v2,
+    insert_lead_embedding_v2,
 )
+from pipeline.embedding_snapshot import build_embedding_snapshot_v1
+from pipeline.embeddings import get_embedding
 from pipeline.validation import check_lead_signals
 from pipeline.context import build_context
 from pipeline.dentist_profile import (
@@ -140,6 +144,28 @@ def _compute_run_stats(signals: List[Dict]) -> Dict:
     counts["total"] = total
     counts["signal_coverage_pct"] = round(100 * known / total, 1) if total else 0
     return counts
+
+
+def _store_lead_embedding(lead_id: int, lead: Dict, force_embed: bool = False) -> None:
+    """Store canonical embedding for dental lead with objective_intelligence. Skips if already exists unless force_embed."""
+    version, etype = "v1_structural", "objective_state"
+    if not force_embed and get_lead_embedding_v2(lead_id, version, etype):
+        return
+    text = build_embedding_snapshot_v1(lead)
+    if not text:
+        return
+    try:
+        emb = get_embedding(text)
+        if emb:
+            insert_lead_embedding_v2(
+                lead_id=lead_id,
+                embedding=emb,
+                text=text,
+                embedding_version=version,
+                embedding_type=etype,
+            )
+    except Exception as e:
+        logger.warning("Embedding storage failed for lead_id=%s: %s", lead_id, e)
 
 
 def _store_decision(lead: Dict, decision, agency_type: str) -> None:
@@ -362,6 +388,7 @@ def run_enrichment_pipeline(
     input_file: str = None,
     max_leads: int = None,
     place_ids_file: str = None,
+    force_embed: bool = False,
 ) -> List[Dict]:
     """
     Run the complete enrichment and signal extraction pipeline.
@@ -558,6 +585,9 @@ def run_enrichment_pipeline(
                     sales_intervention_intelligence=sales_intel if sales_intel else None,
                     objective_decision_layer=obj_layer if obj_layer else None,
                 )
+                # Store embedding for dental leads with objective_intelligence
+                if merged.get("objective_intelligence"):
+                    _store_lead_embedding(lead_id, merged, force_embed=force_embed)
             else:
                 # Non-dental: semantic signals -> Decision Agent
                 semantic = build_semantic_signals(merged)
@@ -655,6 +685,7 @@ def main():
     parser.add_argument("--agency-type", choices=("seo", "marketing"), default=None, help="Agency context for Decision Agent (default: AGENCY_TYPE env or 'marketing')")
     parser.add_argument("--input", "-i", help="Input leads JSON (default: latest output/leads_*.json)")
     parser.add_argument("--place-ids", help="Path to file with place_ids (one per line or JSON array); only enrich these leads")
+    parser.add_argument("--force-embed", action="store_true", help="Re-embed leads even if embedding already exists")
     args = parser.parse_args()
     
     CONFIG["max_leads"] = args.max_leads
@@ -676,6 +707,7 @@ def main():
         input_file=args.input,
         max_leads=CONFIG["max_leads"],
         place_ids_file=args.place_ids,
+        force_embed=args.force_embed,
     )
     
     logger.info(f"\nCompleted at: {datetime.now().isoformat()}")

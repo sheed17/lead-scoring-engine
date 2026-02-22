@@ -9,6 +9,18 @@ No model version labels. Wording focused on SEO for dental practices (local visi
 
 from typing import Dict, Any, List, Optional, Tuple
 
+
+def _is_dental_for_brief(lead: Dict[str, Any]) -> bool:
+    """Lightweight dental check for brief rendering (avoids heavy dentist_profile import)."""
+    if lead.get("dentist_profile_v1"):
+        return True
+    if (lead.get("objective_intelligence") or {}).get("service_intel"):
+        return True
+    name = (lead.get("name") or "").lower()
+    if "dental" in name or "dentist" in name:
+        return True
+    return False
+
 # Canonical service buckets: canonical_label -> list of raw strings to match (lowercase)
 CANONICAL_SERVICE_BUCKETS: Dict[str, List[str]] = {
     "implants": ["implant", "dental implant", "implants"],
@@ -45,21 +57,140 @@ PRIMARY_SERVICE_PRIORITY: List[Tuple[str, str]] = [
     ("veneers", "Veneers"),
     ("cosmetic", "Cosmetic"),
 ]
-# Case value proxy (low, high) per canonical key for revenue breakdown
+# Case value proxy (low, high) per canonical key for revenue breakdown — tight deterministic bands
 PRIMARY_SERVICE_CASE_VALUE: Dict[str, Tuple[int, int]] = {
-    "implants": (4000, 7000),
-    "invisalign": (3500, 6000),
-    "orthodontic": (3500, 6000),
+    "implants": (4000, 6000),
+    "invisalign": (3500, 5500),
+    "orthodontic": (3500, 5500),
     "veneers": (3000, 5000),
     "cosmetic": (3000, 5000),
 }
-# Consult range (low, high) per traffic_estimate_tier
+# Consult range (low, high) per traffic_estimate_tier — max spread 2x
 TRAFFIC_TIER_CONSULTS: Dict[str, Tuple[int, int]] = {
-    "High": (3, 12),
-    "Moderate": (2, 8),
+    "High": (3, 6),
+    "Moderate": (2, 4),
 }
-DEFAULT_CONSULTS = (1, 4)
+DEFAULT_CONSULTS = (1, 3)
 DEFAULT_CASE_VALUE = (2500, 4000)
+
+
+def compute_opportunity_profile(lead: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Deterministic Opportunity Profile label and short parenthetical why.
+    No LLM. No new APIs. Uses objective_intelligence, competitive_snapshot, revenue_intelligence, signals.
+    Returns {"label": "High-Leverage"|"Moderate"|"Low-Leverage", "why": "..."} or {} when omitted.
+    """
+    try:
+        oi = lead.get("objective_intelligence") or {}
+        cs = lead.get("competitive_snapshot") or oi.get("competitive_profile") or {}
+        ri = lead.get("revenue_intelligence") or {}
+        if lead.get("signals") and isinstance(lead["signals"], dict):
+            signals = lead["signals"]
+        else:
+            signals = {k: v for k, v in lead.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating")}
+        service = oi.get("service_intel") or lead.get("service_intelligence") or {}
+
+        missing_pages = service.get("missing_high_value_pages")
+        missing_high_value = bool(missing_pages and (isinstance(missing_pages, list) and len(missing_pages) > 0))
+
+        schema_detected = service.get("schema_detected")
+        if schema_detected is None:
+            schema_detected = signals.get("signal_has_schema_microdata")
+        schema_missing = (schema_detected is False)
+
+        market_density = (cs.get("market_density_score") or "").strip() or (oi.get("competitive_profile") or {}).get("market_density") or ""
+        high_density = (market_density == "High")
+
+        reviews = lead.get("signal_review_count") or signals.get("signal_review_count") or signals.get("user_ratings_total") or lead.get("user_ratings_total") or 0
+        try:
+            reviews = int(reviews)
+        except (TypeError, ValueError):
+            reviews = 0
+
+        local_avg = cs.get("avg_review_count") if cs.get("avg_review_count") is not None else cs.get("avg_reviews")
+        try:
+            local_avg_reviews = float(local_avg) if local_avg is not None else 0
+        except (TypeError, ValueError):
+            local_avg_reviews = 0
+
+        review_deficit = (local_avg_reviews > 0 and reviews < 0.5 * local_avg_reviews)
+
+        paid_channels = signals.get("signal_paid_ads_channels")
+        paid_active = (
+            signals.get("signal_runs_paid_ads") is True
+            or (isinstance(paid_channels, list) and len(paid_channels) > 0)
+            or (paid_channels and not isinstance(paid_channels, list))
+        )
+
+        if missing_high_value and high_density and (schema_missing or paid_active or review_deficit):
+            label = "High-Leverage"
+        elif missing_high_value and (high_density or schema_missing or paid_active):
+            label = "Moderate"
+        else:
+            label = "Low-Leverage"
+
+        fragments = []
+        if missing_high_value:
+            fragments.append("high-ticket service offered but missing dedicated landing page")
+        if schema_missing:
+            fragments.append("schema support missing")
+        if review_deficit:
+            fragments.append("review authority below local market")
+        if paid_active:
+            fragments.append("paid demand present but capture layer is weak")
+        if high_density:
+            fragments.append("high-density competitive market")
+        why = ", ".join(fragments[:3])
+        if not why:
+            why = "baseline capture and market conditions"
+
+        return {"label": label, "why": why}
+    except Exception:
+        return {}
+
+
+def compute_paid_demand_status(lead: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Deterministic Paid Demand Status from existing signals.
+    No LLM. No new APIs.
+    Returns {"status": "...", "interpretation": "..."} or {} when omitted.
+    """
+    try:
+        signals = lead.get("signals")
+        if not isinstance(signals, dict):
+            signals = {k: v for k, v in lead.items() if k.startswith("signal_")}
+        ri = lead.get("revenue_intelligence") or {}
+        cs = lead.get("competitive_snapshot") or (lead.get("objective_intelligence") or {}).get("competitive_profile") or {}
+        oi = lead.get("objective_intelligence") or {}
+        service_intel = oi.get("service_intel") or oi.get("service_intelligence") or lead.get("service_intelligence") or {}
+
+        channels = signals.get("signal_paid_ads_channels") or []
+        if not isinstance(channels, list):
+            channels = [channels] if channels else []
+        channels_lower = [str(c).strip().lower() for c in channels if c]
+
+        runs_google = signals.get("signal_runs_paid_ads") is True and "google" in channels_lower
+        runs_meta = "meta" in channels_lower
+        high_density = (
+            (cs.get("market_density_score") or "").strip() == "High"
+            or (cs.get("market_density") or "").strip() == "High"
+        )
+        high_ticket_raw = service_intel.get("high_ticket_detected") or service_intel.get("high_ticket_procedures_detected")
+        high_ticket = bool(high_ticket_raw and (isinstance(high_ticket_raw, list) and len(high_ticket_raw) > 0))
+
+        if not runs_google and not runs_meta:
+            return {"status": "Inactive", "interpretation": "No detectable paid demand activity."}
+        if runs_google and high_density and high_ticket:
+            return {"status": "Aggressive Search Presence", "interpretation": "Practice appears to be competing actively for high-value service demand."}
+        if runs_google and runs_meta:
+            return {"status": "Active (Search + Meta)", "interpretation": "Practice is investing in both high-intent and awareness channels."}
+        if runs_google:
+            return {"status": "Active (Search)", "interpretation": "Practice is investing in high-intent search demand."}
+        if runs_meta:
+            return {"status": "Active (Meta)", "interpretation": "Practice has Meta ads presence."}
+        return {}
+    except Exception:
+        return {}
 
 
 def _primary_service_from_missing(missing: List[str]) -> Optional[Tuple[str, str]]:
@@ -347,6 +478,10 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
     if primary_leverage:
         vm["executive_diagnosis"]["primary_leverage"] = primary_leverage
 
+    opp = compute_opportunity_profile(lead)
+    if opp and opp.get("label") and opp.get("why"):
+        vm["executive_diagnosis"]["opportunity_profile"] = opp
+
     if gap_lo is not None and gap_hi is not None:
         vm["executive_diagnosis"]["modeled_revenue_upside"] = f"{_fmt_currency(gap_lo)}–{_fmt_currency(gap_hi)} annually"
 
@@ -416,22 +551,39 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
     if strat and isinstance(strat, dict) and strat.get("service"):
         vm["strategic_gap"] = strat
 
-    # ---------- 3) Demand Signals ----------
-    vm["demand_signals"]["google_ads_active"] = signals.get("signal_runs_paid_ads") is True
-    paid_spend = rev.get("paid_spend_range_estimate") or (s60 or {}).get("paid_spend_range_estimate")
-    if paid_spend:
-        vm["demand_signals"]["paid_spend_estimate"] = str(paid_spend)
-    traffic_monthly = rev.get("traffic_estimate_monthly")
-    if not traffic_monthly and s60 and s60.get("traffic_estimate"):
-        traffic_monthly = (s60["traffic_estimate"] or {}).get("traffic_estimate_monthly")
-    if isinstance(traffic_monthly, dict):
-        lo, hi = traffic_monthly.get("lower"), traffic_monthly.get("upper")
+    # ---------- 3) Demand Signals (minimal, factual, deterministic) ----------
+    channels = signals.get("signal_paid_ads_channels") or []
+    if not isinstance(channels, list):
+        channels = [channels] if channels else []
+    channels_lower = [str(c).strip().lower() for c in channels if c]
+    runs_google = signals.get("signal_runs_paid_ads") is True and "google" in channels_lower
+    runs_meta = "meta" in channels_lower
+    vm["demand_signals"]["google_ads_line"] = (
+        "Active (Search campaigns detected)" if runs_google else "Not detected"
+    )
+    vm["demand_signals"]["meta_ads_line"] = "Active" if runs_meta else "Not detected"
+    traffic_range = rev.get("traffic_estimate_range")
+    if isinstance(traffic_range, dict):
+        lo = traffic_range.get("lower") or traffic_range.get("low")
+        hi = traffic_range.get("upper") or traffic_range.get("high")
         if lo is not None and hi is not None:
             vm["demand_signals"]["estimated_traffic"] = f"{lo}–{hi}"
-    last_rev = signals.get("signal_last_review_days_ago")
+    if not vm["demand_signals"].get("estimated_traffic"):
+        traffic_monthly = rev.get("traffic_estimate_monthly")
+        if not traffic_monthly and s60 and s60.get("traffic_estimate"):
+            traffic_monthly = (s60["traffic_estimate"] or {}).get("traffic_estimate_monthly")
+        if isinstance(traffic_monthly, dict):
+            lo, hi = traffic_monthly.get("lower"), traffic_monthly.get("upper")
+            if lo is not None and hi is not None:
+                vm["demand_signals"]["estimated_traffic"] = f"{lo}–{hi}"
+    last_rev = lead.get("days_since_last_review")
+    if last_rev is None:
+        last_rev = signals.get("signal_last_review_days_ago")
     if last_rev is not None:
         vm["demand_signals"]["last_review_days_ago"] = last_rev
-    vel = signals.get("signal_review_velocity_30d")
+    vel = lead.get("review_velocity_last_30_days")
+    if vel is None:
+        vel = signals.get("signal_review_velocity_30d")
     if vel is not None:
         vm["demand_signals"]["review_velocity_30d"] = vel
 
@@ -467,6 +619,21 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
             case_low, case_high = PRIMARY_SERVICE_CASE_VALUE.get(key, DEFAULT_CASE_VALUE)
             annual_low = round((consult_low * case_low * 12) / 1000) * 1000
             annual_high = round((consult_high * case_high * 12) / 1000) * 1000
+
+            # Cap annual_high at 30% of revenue band upper; scale annual_low proportionally
+            band = rev.get("revenue_band_estimate")
+            if isinstance(band, dict) and band.get("upper") is not None:
+                try:
+                    revenue_upper = float(band["upper"])
+                    max_allowed = revenue_upper * 0.30
+                    if annual_high > max_allowed:
+                        scale = max_allowed / annual_high if annual_high > 0 else 1.0
+                        annual_low = round((annual_low * scale) / 1000) * 1000
+                        annual_high = round(max_allowed / 1000) * 1000
+                except (TypeError, ValueError):
+                    pass
+
+            annual_low = min(annual_low, annual_high)  # ensure annual_low <= annual_high
             vm["revenue_upside_capture_gap"] = {
                 "primary_service": display_name,
                 "consult_low": consult_low,
@@ -532,6 +699,15 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
                         part += f" (Time to signal: {days}d)"
                     steps.append(part)
     if steps:
+        # Dental only: dynamically calibrate Step 3 based on Paid Demand Status
+        if _is_dental_for_brief(lead) and len(steps) >= 3:
+            paid_status = compute_paid_demand_status(lead)
+            status = (paid_status or {}).get("status", "Inactive")
+            if status in ("Active (Search)", "Active (Search + Meta)", "Aggressive Search Presence"):
+                step3 = "Step 3 — Paid Alignment: Align Google Ads traffic to service-specific landing page and verify conversion tracking integrity."
+            else:
+                step3 = "Step 3 — Demand Activation: Launch controlled paid search test targeting high-intent service keywords."
+            steps = steps[:2] + [step3]
         vm["intervention_plan"] = steps
     else:
         # Fallback: Strategic Frame + Tactical Levers
@@ -582,6 +758,9 @@ def render_revenue_brief_html(lead: Dict[str, Any], title: str = "Revenue Intell
             parts.append(f"<p><strong>Constraint:</strong> {_h(ed['constraint'])}</p>")
         if ed.get("primary_leverage"):
             parts.append(f"<p><strong>Primary Leverage:</strong> {_h(ed['primary_leverage'])}</p>")
+        opp = ed.get("opportunity_profile")
+        if opp and isinstance(opp, dict) and opp.get("label") and opp.get("why"):
+            parts.append(f"<p><strong>Opportunity Profile:</strong> {_h(opp['label'])} <em>({_h(opp['why'])})</em></p>")
         if ed.get("modeled_revenue_upside"):
             parts.append(f"<p><strong>Modeled Revenue Upside:</strong> <strong>{_h(ed['modeled_revenue_upside'])}</strong></p>")
         if footnote:
@@ -653,25 +832,25 @@ def render_revenue_brief_html(lead: Dict[str, Any], title: str = "Revenue Intell
             + "\n</section>"
         )
 
-    # 3) Demand Signals
+    # 3) Demand Signals (minimal, factual; omit if all data missing)
     ds = vm.get("demand_signals") or {}
-    if ds:
-        parts = []
-        parts.append(f"<p><strong>Google Ads:</strong> {'Active' if ds.get('google_ads_active') else 'Not active'}</p>")
-        if ds.get("paid_spend_estimate"):
-            parts.append(f"<p><strong>Paid Spend Estimate:</strong> {_h(ds['paid_spend_estimate'])}</p>")
-        if ds.get("estimated_traffic"):
-            parts.append(f"<p><strong>Estimated Traffic:</strong> {_h(ds['estimated_traffic'])}</p>")
-        if ds.get("last_review_days_ago") is not None:
-            parts.append(f"<p><strong>Last Review:</strong> {_h(ds['last_review_days_ago'])} days ago</p>")
-        if ds.get("review_velocity_30d") is not None:
-            parts.append(f"<p><strong>Review Velocity:</strong> {_h(ds['review_velocity_30d'])} in last 30 days</p>")
-        if parts:
-            sections.append(
-                "<section class=\"brief-section brief-demand\">\n  <h2>Demand Signals</h2>\n  "
-                + "\n  ".join(parts)
-                + "\n</section>"
-            )
+    ds_parts = []
+    if ds.get("google_ads_line"):
+        ds_parts.append(f"<p><strong>Google Ads:</strong> {_h(ds['google_ads_line'])}</p>")
+    if ds.get("meta_ads_line"):
+        ds_parts.append(f"<p><strong>Meta Ads:</strong> {_h(ds['meta_ads_line'])}</p>")
+    if ds.get("estimated_traffic"):
+        ds_parts.append(f"<p><strong>Estimated Traffic:</strong> {_h(ds['estimated_traffic'])}</p>")
+    if ds.get("last_review_days_ago") is not None:
+        ds_parts.append(f"<p><strong>Last Review:</strong> {_h(ds['last_review_days_ago'])} days ago</p>")
+    if ds.get("review_velocity_30d") is not None:
+        ds_parts.append(f"<p><strong>Review Velocity:</strong> {_h(ds['review_velocity_30d'])} in last 30 days</p>")
+    if ds_parts:
+        sections.append(
+            "<section class=\"brief-section brief-demand\">\n  <h2>Demand Signals</h2>\n  "
+            + "\n  ".join(ds_parts)
+            + "\n</section>"
+        )
 
     # 4) Local SEO & High-Value Service Pages (schema, GBP, service pages; revenue only in Executive Diagnosis)
     ht = vm.get("high_ticket_gaps") or {}

@@ -68,6 +68,10 @@ from pipeline.llm_structured_extraction import extract_structured
 from pipeline.llm_executive_compression import build_executive_summary_and_outreach
 from pipeline.llm_narrator import narrate_from_canonical
 from pipeline.service_depth import get_page_texts_for_llm
+from pipeline.db import init_db, create_run, insert_lead, insert_lead_signals
+from pipeline.db import get_lead_embedding_v2, insert_lead_embedding_v2
+from pipeline.embedding_snapshot import build_embedding_snapshot_v1
+from pipeline.embeddings import get_embedding
 
 # Configure logging
 logging.basicConfig(
@@ -369,6 +373,35 @@ def run_small_test():
             "sales_intervention_intelligence": lead.get("sales_intervention_intelligence"),
         }
     logger.info(f"  Dental leads with profile: {dentist_count}/{len(final_leads)}")
+
+    # =========================================
+    # Step 6b: Optional embedding storage (STORE_EMBEDDINGS=1)
+    # =========================================
+    if os.getenv("STORE_EMBEDDINGS", "").strip().lower() in ("1", "true", "yes"):
+        logger.info("\n[Step 6b] Storing embeddings (STORE_EMBEDDINGS=1)...")
+        init_db()
+        run_id = create_run({"source": "test_small"})
+        for lead in final_leads:
+            lead_id = insert_lead(run_id, lead)
+            sig = {k: v for k, v in lead.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating")}
+            insert_lead_signals(lead_id, sig)
+            if is_dental_practice(lead) and lead.get("objective_intelligence"):
+                text = build_embedding_snapshot_v1(lead)
+                if text:
+                    try:
+                        emb = get_embedding(text)
+                        if emb and not get_lead_embedding_v2(lead_id, "v1_structural", "objective_state"):
+                            insert_lead_embedding_v2(
+                                lead_id=lead_id,
+                                embedding=emb,
+                                text=text,
+                                embedding_version="v1_structural",
+                                embedding_type="objective_state",
+                            )
+                            logger.info(f"    Stored embedding for {lead.get('name', '')[:40]}")
+                    except Exception as e:
+                        logger.warning("    Embedding failed for %s: %s", lead.get("name", ""), e)
+        logger.info("  Embedding storage complete")
     
     # =========================================
     # Step 7: Save results (frozen contract)
