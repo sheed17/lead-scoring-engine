@@ -1,0 +1,364 @@
+"""
+Enrichment service: resolves place_id, runs pipeline, returns diagnostic summary.
+Reuses existing pipeline modules; no duplicated enrichment logic.
+"""
+
+import os
+import sys
+import logging
+from typing import Dict, Optional, List, Any
+
+# Ensure project root on path when running from backend
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
+except ImportError:
+    pass
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_city_from_address(formatted_address: Optional[str]) -> str:
+    """Extract city from formatted_address (e.g. '123 Main St, San Jose, CA 95110')."""
+    if not formatted_address or not isinstance(formatted_address, str):
+        return "—"
+    parts = [p.strip() for p in formatted_address.split(",")]
+    if len(parts) >= 2:
+        # Second part is often city (US format)
+        return parts[-2] if len(parts) >= 2 else parts[0]
+    return parts[0] if parts else "—"
+
+
+def _build_diagnostic_response(
+    lead_id: int,
+    merged: Dict[str, Any],
+    city: str,
+) -> Dict[str, Any]:
+    """Build UI-ready diagnostic response from enriched lead."""
+    oi = merged.get("objective_intelligence") or {}
+    comp = merged.get("competitive_snapshot") or (oi.get("competitive_profile") or {})
+    ed = {}
+    if merged.get("agency_decision_v1") and isinstance(merged["agency_decision_v1"], dict):
+        adv1 = merged["agency_decision_v1"]
+        exec_diag = adv1.get("executive_diagnosis") or adv1.get("executive_diagnosis_vm")
+        if isinstance(exec_diag, dict):
+            ed = exec_diag
+
+    # Use revenue_brief_renderer for canonical values when available
+    try:
+        from pipeline.revenue_brief_renderer import (
+            build_revenue_brief_view_model,
+            compute_opportunity_profile,
+            compute_paid_demand_status,
+        )
+        vm = build_revenue_brief_view_model(merged)
+        opp = compute_opportunity_profile(merged)
+        paid = compute_paid_demand_status(merged)
+    except Exception as e:
+        logger.warning("Could not use revenue_brief_renderer: %s", e)
+        vm = {}
+        opp = {}
+        paid = {}
+
+    opportunity_profile = "—"
+    if opp and opp.get("label") and opp.get("why"):
+        opportunity_profile = f"{opp['label']} ({opp['why']})"
+    elif ed.get("opportunity_profile") and isinstance(ed["opportunity_profile"], dict):
+        o = ed["opportunity_profile"]
+        if o.get("label"):
+            opportunity_profile = f"{o.get('label', '')} ({o.get('why', '')})".strip().rstrip("()").strip() or "—"
+
+    constraint = (
+        ed.get("constraint")
+        or (oi.get("root_constraint") or {}).get("label")
+        or "—"
+    )
+    primary_leverage = ed.get("primary_leverage") or "—"
+    market_density = (
+        comp.get("market_density_score")
+        or comp.get("market_density")
+        or (vm.get("market_position") or {}).get("market_density")
+        or "—"
+    )
+    review_position = (
+        comp.get("review_positioning")
+        or comp.get("review_positioning_tier")
+        or (vm.get("competitive_context") or {}).get("line2", "—")
+    )
+    if isinstance(review_position, str) and len(review_position) > 100:
+        review_position = "—"
+    paid_status = (paid or {}).get("status") or "Inactive"
+
+    # Intervention plan
+    plan_oi = (oi.get("intervention_plan") or [])
+    plan_obj = (merged.get("objective_decision_layer") or {}).get("intervention_plan") or []
+    plan = plan_oi if plan_oi else plan_obj
+    sales_intel = merged.get("sales_intervention_intelligence") or {}
+    plan_sales = sales_intel.get("intervention_plan") or []
+    if plan_sales and not plan:
+        plan = plan_sales
+
+    intervention_items: List[Dict[str, Any]] = []
+    for i, item in enumerate((plan if isinstance(plan, list) else [])[:6]):
+        if not isinstance(item, dict):
+            continue
+        step = item.get("priority") or item.get("step") or (i + 1)
+        cat = str(item.get("category") or "SEO").strip()
+        action = str(item.get("action") or "").strip()
+        if action:
+            intervention_items.append({"step": int(step), "category": cat, "action": action})
+
+    # Fallback from vm
+    if not intervention_items and vm.get("intervention_plan"):
+        for i, s in enumerate(vm["intervention_plan"][:6]):
+            if isinstance(s, dict) and s.get("action"):
+                intervention_items.append({
+                    "step": i + 1,
+                    "category": str(s.get("category") or "SEO"),
+                    "action": str(s.get("action", "")),
+                })
+
+    business_name = merged.get("name") or "—"
+    if city == "—" and merged.get("formatted_address"):
+        city = _extract_city_from_address(merged.get("formatted_address"))
+
+    return {
+        "lead_id": lead_id,
+        "business_name": business_name,
+        "city": str(city),
+        "opportunity_profile": str(opportunity_profile),
+        "constraint": str(constraint),
+        "primary_leverage": str(primary_leverage),
+        "market_density": str(market_density),
+        "review_position": str(review_position),
+        "paid_status": str(paid_status),
+        "intervention_plan": intervention_items,
+    }
+
+
+def run_diagnostic(
+    business_name: str,
+    city: str,
+    website: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Resolve place, run enrichment pipeline, store lead, return diagnostic summary.
+
+    Required: business_name, city
+    Optional: website (for reference; resolution uses name+city)
+
+    Raises FileNotFoundError for not found, RuntimeError for pipeline/API failures.
+    """
+    from backend.services.place_resolver import resolve_from_name_city
+    from pipeline.enrich import PlaceDetailsEnricher
+    from pipeline.signals import extract_signals, merge_signals_into_lead
+    from pipeline.meta_ads import get_meta_access_token, augment_lead_with_meta_ads
+    from pipeline.semantic_signals import build_semantic_signals
+    from pipeline.decision_agent import DecisionAgent
+    from pipeline.dentist_profile import is_dental_practice, build_dentist_profile_v1, fetch_website_html_for_trust
+    from pipeline.service_depth import build_service_intelligence, get_page_texts_for_llm
+    from pipeline.competitor_sampling import fetch_competitors_nearby, build_competitive_snapshot
+    from pipeline.objective_decision_layer import compute_objective_decision_layer
+    from pipeline.objective_intelligence import (
+        build_objective_intelligence,
+        build_objective_intelligence_summary,
+    )
+    from pipeline.revenue_intelligence import build_revenue_intelligence
+    from pipeline.dentist_llm_reasoning import dentist_llm_reasoning_layer
+    from pipeline.sales_intervention import build_sales_intervention_intelligence
+    from pipeline.agency_decision import build_agency_decision_v1
+    from pipeline.llm_structured_extraction import extract_structured
+    from pipeline.llm_executive_compression import build_executive_summary_and_outreach
+    from pipeline.context import build_context
+    from pipeline.db import (
+        init_db,
+        create_run,
+        insert_lead,
+        insert_lead_signals,
+        insert_decision,
+        update_lead_dentist_data,
+        update_run_completed,
+        update_run_failed,
+    )
+
+    # 1) Resolve place via name + city (most reliable)
+    lead = resolve_from_name_city(business_name.strip(), city.strip())
+    resolved_city = city.strip()
+
+    if not lead or not lead.get("place_id"):
+        raise FileNotFoundError("Business not found")  # 404
+
+    init_db()
+
+    # 2) Enrich with Place Details
+    try:
+        enricher = PlaceDetailsEnricher()
+    except ValueError as e:
+        raise RuntimeError("Places API not configured") from e
+
+    enriched_list = enricher.enrich_leads_batch([lead], progress_interval=999)
+    if not enriched_list:
+        raise RuntimeError("Place Details enrichment failed")
+
+    enriched = enriched_list[0]
+
+    # 3) Extract signals
+    signals = extract_signals(enriched)
+    merged = merge_signals_into_lead(enriched, signals)
+
+    use_meta = get_meta_access_token() is not None
+    if use_meta:
+        augment_lead_with_meta_ads(merged)
+
+    agency_type = os.getenv("AGENCY_TYPE", "marketing").lower() or "marketing"
+    run_id = create_run({
+        "source": "diagnostic_api",
+        "agency_type": agency_type,
+    })
+    agent = DecisionAgent(agency_type=agency_type)
+
+    try:
+        lead_id = insert_lead(run_id, merged)
+        insert_lead_signals(lead_id, signals)
+
+        if is_dental_practice(merged):
+            url = merged.get("signal_website_url")
+            website_html = fetch_website_html_for_trust(url) if url else None
+            dentist_profile_v1 = build_dentist_profile_v1(merged, website_html=website_html)
+            obj_layer = None
+            llm_reasoning_layer = {}
+            sales_intel = None
+            if dentist_profile_v1:
+                merged["dentist_profile_v1"] = dentist_profile_v1
+                procedure_mentions = (dentist_profile_v1.get("review_intent_analysis") or {}).get("procedure_mentions") or []
+                service_intel = build_service_intelligence(url, website_html, procedure_mentions)
+                competitors = []
+                search_radius_used_miles = 2
+                lat, lng = merged.get("latitude"), merged.get("longitude")
+                if lat is not None and lng is not None:
+                    competitors, search_radius_used_miles = fetch_competitors_nearby(lat, lng, merged.get("place_id"))
+                competitive_snap = build_competitive_snapshot(merged, competitors, search_radius_used_miles) if competitors else {}
+                merged["competitive_snapshot"] = competitive_snap
+                merged["service_intelligence"] = service_intel
+                obj_layer = compute_objective_decision_layer(
+                    merged,
+                    service_intelligence=service_intel,
+                    competitive_snapshot=competitive_snap if competitors else None,
+                    revenue_leverage=None,
+                )
+                merged["objective_decision_layer"] = obj_layer if obj_layer else {}
+                pricing_page_detected = False
+                if os.getenv("USE_LLM_STRUCTURED_EXTRACTION", "").strip().lower() in ("1", "true", "yes"):
+                    page_texts = get_page_texts_for_llm(merged.get("signal_website_url"), website_html)
+                    pricing_page_detected = bool(page_texts and page_texts.get("pricing_page_text"))
+                rev_intel = build_revenue_intelligence(
+                    merged,
+                    dentist_profile_v1,
+                    obj_layer or {},
+                    pricing_page_detected=pricing_page_detected,
+                    paid_intelligence=merged.get("paid_intelligence"),
+                )
+                merged["revenue_intelligence"] = rev_intel
+
+            oi = build_objective_intelligence(merged)
+            merged["objective_intelligence"] = oi
+            oi_summary = build_objective_intelligence_summary(oi)
+            decision = agent.decide_from_objective_summary(oi_summary, lead_name=merged.get("name") or "")
+            merged["verdict"] = decision.verdict
+            merged["confidence"] = decision.confidence
+            insert_decision(
+                lead_id=lead_id,
+                agency_type=agency_type,
+                signals_snapshot={"objective_intelligence_summary": oi_summary},
+                verdict=decision.verdict,
+                confidence=decision.confidence,
+                reasoning=decision.reasoning,
+                primary_risks=decision.primary_risks,
+                what_would_change=decision.what_would_change,
+                prompt_version=agent.prompt_version,
+            )
+
+            if dentist_profile_v1:
+                context = build_context(merged)
+                lead_score = round((merged.get("confidence") or 0) * 100)
+                llm_reasoning_layer = dentist_llm_reasoning_layer(
+                    business_snapshot=merged,
+                    dentist_profile_v1=dentist_profile_v1,
+                    context_dimensions=context.get("context_dimensions", []),
+                    lead_score=lead_score,
+                    priority=merged.get("verdict"),
+                    confidence=merged.get("confidence"),
+                )
+                sales_intel = build_sales_intervention_intelligence(
+                    business_snapshot=merged,
+                    dentist_profile_v1=dentist_profile_v1,
+                    context_dimensions=context.get("context_dimensions", []),
+                    verdict=merged.get("verdict"),
+                    confidence=merged.get("confidence"),
+                    llm_reasoning_layer=llm_reasoning_layer,
+                )
+                llm_extraction = None
+                if os.getenv("USE_LLM_STRUCTURED_EXTRACTION", "").strip().lower() in ("1", "true", "yes"):
+                    page_texts = get_page_texts_for_llm(merged.get("signal_website_url"), website_html)
+                    llm_extraction = extract_structured(
+                        (page_texts or {}).get("homepage_text") or "",
+                        (page_texts or {}).get("services_page_text"),
+                        (page_texts or {}).get("pricing_page_text"),
+                    )
+                    merged["llm_structured_extraction"] = llm_extraction
+                executive_summary = None
+                outreach_angle = None
+                rev_intel = merged.get("revenue_intelligence") or {}
+                if os.getenv("USE_LLM_EXECUTIVE_COMPRESSION", "").strip().lower() in ("1", "true", "yes"):
+                    root = (obj_layer or {}).get("root_bottleneck_classification") or {}
+                    comp_res = build_executive_summary_and_outreach(
+                        primary_constraint=root.get("why_root_cause") or root.get("bottleneck") or "",
+                        revenue_gap=rev_intel.get("organic_revenue_gap_estimate"),
+                        cost_leakage_signals=rev_intel.get("cost_leakage_signals"),
+                        service_focus=(merged.get("llm_structured_extraction") or {}).get("service_focus"),
+                    )
+                    executive_summary = comp_res.get("executive_summary")
+                    outreach_angle = comp_res.get("outreach_angle")
+                merged["agency_decision_v1"] = build_agency_decision_v1(
+                    merged,
+                    dentist_profile_v1,
+                    obj_layer or {},
+                    rev_intel,
+                    llm_extraction=llm_extraction,
+                    executive_summary=executive_summary,
+                    outreach_angle=outreach_angle,
+                )
+            update_lead_dentist_data(
+                lead_id,
+                dentist_profile_v1=merged.get("dentist_profile_v1"),
+                llm_reasoning_layer=llm_reasoning_layer if dentist_profile_v1 else None,
+                sales_intervention_intelligence=sales_intel if sales_intel else None,
+                objective_decision_layer=obj_layer if obj_layer else None,
+            )
+        else:
+            semantic = build_semantic_signals(merged)
+            decision = agent.decide(semantic, lead_name=merged.get("name") or "")
+            merged["verdict"] = decision.verdict
+            merged["confidence"] = decision.confidence
+            insert_decision(
+                lead_id=lead_id,
+                agency_type=agency_type,
+                signals_snapshot=semantic,
+                verdict=decision.verdict,
+                confidence=decision.confidence,
+                reasoning=decision.reasoning,
+                primary_risks=decision.primary_risks,
+                what_would_change=decision.what_would_change,
+                prompt_version=agent.prompt_version,
+            )
+
+        update_run_completed(run_id, 1, run_stats={"total": 1})
+        return _build_diagnostic_response(lead_id, merged, resolved_city)
+
+    except Exception:
+        update_run_failed(run_id)
+        raise

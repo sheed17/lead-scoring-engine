@@ -43,6 +43,30 @@ The system is specialized for dental practices. For each lead we produce:
 | **Export** | `export_leads.py` — Context-first or legacy export from DB |
 | **Briefs** | `render_brief.py` — Revenue Intelligence Brief HTML per lead |
 | **Outcomes** | `update_outcome.py` — Create/update outcome records for the loop |
+| **API** | FastAPI backend — `POST /diagnostic` for single-lead enrichment |
+
+### Run the API server
+
+From the project root:
+
+```bash
+uvicorn backend.main:app --reload
+```
+
+- Health check: `GET /health`
+- Diagnostic: `POST /diagnostic` with body `{"business_name": "Example Dental", "city": "San Jose"}` (website optional)
+
+### Run the frontend (Next.js)
+
+From the project root, start the API first, then:
+
+```bash
+cd frontend
+cp .env.local.example .env.local   # optional: edit NEXT_PUBLIC_API_URL if backend runs elsewhere
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). The UI shows API status and a diagnostic form (business name, city, optional website) and displays the structured result.
 
 ### Database
 - SQLite: runs, leads, signals, decisions, embeddings (versioned), outcomes
