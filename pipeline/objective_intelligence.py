@@ -253,6 +253,25 @@ def generate_intervention_plan_from_intelligence(
         logger.warning("openai package not installed; skipping LLM intervention plan")
         return []
 
+    # Build existing infrastructure context to prevent recommending what already exists
+    signals = {k: v for k, v in lead.items() if k.startswith("signal_")}
+    existing_infra = []
+    if signals.get("signal_has_automated_scheduling") is True:
+        existing_infra.append("Online booking: ALREADY EXISTS — do NOT recommend adding it")
+    if signals.get("signal_has_contact_form") is True:
+        existing_infra.append("Contact form: ALREADY EXISTS")
+    if signals.get("signal_has_phone") is True:
+        existing_infra.append("Phone prominent: YES")
+    if signals.get("signal_has_schema_microdata") is True:
+        existing_infra.append("Schema markup: ALREADY IMPLEMENTED — do NOT recommend adding it")
+    if signals.get("signal_runs_paid_ads") is True:
+        channels = signals.get("signal_paid_ads_channels") or []
+        ch_str = ", ".join(str(c) for c in channels) if channels else "unknown"
+        existing_infra.append(f"Paid ads: ACTIVE on {ch_str} — do NOT recommend launching paid ads, instead focus on optimizing existing campaigns")
+    if signals.get("signal_mobile_friendly") is True:
+        existing_infra.append("Mobile optimized: YES")
+    existing_infra_text = "\n".join(f"- {x}" for x in existing_infra) if existing_infra else "No infrastructure data available"
+
     system = """You are generating a 3-step strategic intervention plan for a dental SEO opportunity.
 
 Rules:
@@ -262,6 +281,9 @@ Rules:
 - Do not give generic SEO advice.
 - Each step must directly address the root constraint.
 - If strategic_gap exists, at least one step must explicitly address it.
+- CRITICAL: Check "Existing Infrastructure" — NEVER recommend adding something that already exists (online booking, schema, paid ads, etc.). Instead, recommend OPTIMIZING or LEVERAGING what exists.
+- If paid ads are active, recommend aligning ad traffic to specific service pages rather than launching new campaigns.
+- If online booking exists, recommend optimizing the booking flow rather than adding booking.
 - Keep actions concise and tactical.
 - Maximum 3 steps.
 - Return JSON only.
@@ -295,6 +317,9 @@ Cost Leakage Signals:
 
 Conversion Profile:
 {conversion_text}
+
+Existing Infrastructure (DO NOT recommend adding what already exists):
+{existing_infra_text}
 
 Generate exactly 3 steps. Return JSON only: a single JSON array of exactly 3 objects. No commentary."""
 
@@ -526,7 +551,7 @@ def build_objective_intelligence_summary(objective_intelligence: Dict[str, Any])
         n = comp.get("dentists_sampled")
         r = comp.get("radius_used_miles")
         tier = comp.get("review_tier") or "—"
-        lines.append(f"Competitive: {n} dentists within {r} mi; review tier {tier}")
+        lines.append(f"Competitive: {n} practices within {r} mi; review tier {tier}")
 
     gap = oi.get("competitive_service_gap")
     if gap and isinstance(gap, dict) and gap.get("service"):

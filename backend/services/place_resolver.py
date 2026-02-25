@@ -50,6 +50,8 @@ def _place_to_lead(place: Dict) -> Dict:
         "formatted_address": place.get("formatted_address"),
         "latitude": location.get("lat"),
         "longitude": location.get("lng"),
+        "rating": place.get("rating"),
+        "user_ratings_total": place.get("user_ratings_total", 0),
     }
 
 
@@ -107,11 +109,15 @@ def resolve_from_website(website: str) -> Optional[Dict]:
     return None
 
 
-def _geocode_city(city: str) -> Optional[Tuple[float, float]]:
+def _geocode_city(city: str, state: Optional[str] = None) -> Optional[Tuple[float, float]]:
     """Geocode city name to (lat, lng). Prefer US if ambiguous."""
     key = _get_api_key()
-    # Add USA to disambiguate
-    address = f"{city}, USA" if "," not in city else city
+    if state:
+        address = f"{city}, {state}, USA"
+    elif "," not in city:
+        address = f"{city}, USA"
+    else:
+        address = city
     params = {"address": address, "key": key}
     try:
         resp = requests.get(GEOCODE_URL, params=params, timeout=15)
@@ -133,12 +139,12 @@ def _geocode_city(city: str) -> Optional[Tuple[float, float]]:
         raise
 
 
-def resolve_from_name_city(business_name: str, city: str) -> Optional[Dict]:
+def resolve_from_name_city(business_name: str, city: str, state: Optional[str] = None) -> Optional[Dict]:
     """
-    Resolve place from business_name + city using Geocode + Nearby Search.
+    Resolve place from business_name + city + optional state using Geocode + Nearby Search.
     Returns lead-like dict with place_id, name, etc. Returns best match.
     """
-    coords = _geocode_city(city)
+    coords = _geocode_city(city, state=state)
     if not coords:
         return None
     lat, lng = coords
@@ -163,16 +169,7 @@ def resolve_from_name_city(business_name: str, city: str) -> Optional[Dict]:
         if not results:
             return None
         place = results[0]
-        geometry = place.get("geometry") or {}
-        location = geometry.get("location") or {}
-        return {
-            "place_id": place.get("place_id"),
-            "name": place.get("name"),
-            "address": place.get("vicinity") or place.get("formatted_address"),
-            "formatted_address": place.get("formatted_address"),
-            "latitude": location.get("lat"),
-            "longitude": location.get("lng"),
-        }
+        return _place_to_lead(place)
     except Exception as e:
         logger.exception("resolve_from_name_city failed: %s", e)
         raise

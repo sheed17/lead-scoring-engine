@@ -36,17 +36,22 @@ def build_revenue_intelligence(
     """
     from pipeline.revenue_model_v2 import compute_revenue_v2
     from pipeline.traffic_model_v3 import compute_traffic_v3
+    from pipeline.metro_income import is_high_income_metro
 
     obj = objective_layer or {}
     svc = obj.get("service_intelligence") or {}
     high_ticket = svc.get("high_ticket_procedures_detected") or []
     missing_pages = svc.get("missing_high_value_pages") or []
 
+    city = context.get("city") or context.get("signal_city") or ""
+    state = context.get("state") or context.get("signal_state") or ""
+    high_income = is_high_income_metro(city, state)
+
     revenue_out = compute_revenue_v2(
         context,
         dentist_profile,
         objective_layer,
-        high_income_metro=False,
+        high_income_metro=high_income,
         pricing_page_detected=pricing_page_detected,
     )
     traffic_out = compute_traffic_v3(context, objective_layer)

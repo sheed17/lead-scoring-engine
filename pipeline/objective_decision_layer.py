@@ -423,7 +423,7 @@ def _compute_comparative_context(
         positioning = competitive_snapshot.get("review_positioning") or "—"
         density = competitive_snapshot.get("market_density_score", "")
         return (
-            f"Among {competitive_snapshot['dentists_sampled']} nearby dentists, this practice has "
+            f"Among {competitive_snapshot['dentists_sampled']} nearby practices, this practice has "
             f"{review_count} reviews (sample avg {avg:.0f}); {positioning}. Market density: {density}."
         )
     typical_volume = 50

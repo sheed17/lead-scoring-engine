@@ -64,11 +64,8 @@ from pipeline.db import (
     update_lead_dentist_data,
     update_run_completed,
     update_run_failed,
-    get_lead_embedding_v2,
-    insert_lead_embedding_v2,
 )
-from pipeline.embedding_snapshot import build_embedding_snapshot_v1
-from pipeline.embeddings import get_embedding
+from pipeline.embedding_store import store_lead_embedding_if_eligible
 from pipeline.validation import check_lead_signals
 from pipeline.context import build_context
 from pipeline.dentist_profile import (
@@ -147,25 +144,8 @@ def _compute_run_stats(signals: List[Dict]) -> Dict:
 
 
 def _store_lead_embedding(lead_id: int, lead: Dict, force_embed: bool = False) -> None:
-    """Store canonical embedding for dental lead with objective_intelligence. Skips if already exists unless force_embed."""
-    version, etype = "v1_structural", "objective_state"
-    if not force_embed and get_lead_embedding_v2(lead_id, version, etype):
-        return
-    text = build_embedding_snapshot_v1(lead)
-    if not text:
-        return
-    try:
-        emb = get_embedding(text)
-        if emb:
-            insert_lead_embedding_v2(
-                lead_id=lead_id,
-                embedding=emb,
-                text=text,
-                embedding_version=version,
-                embedding_type=etype,
-            )
-    except Exception as e:
-        logger.warning("Embedding storage failed for lead_id=%s: %s", lead_id, e)
+    """Store canonical embedding for dental lead with objective_intelligence. Delegates to shared pipeline helper."""
+    store_lead_embedding_if_eligible(lead_id, lead, force_embed=force_embed)
 
 
 def _store_decision(lead: Dict, decision, agency_type: str) -> None:

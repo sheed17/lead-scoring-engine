@@ -23,13 +23,16 @@ def _is_dental_for_brief(lead: Dict[str, Any]) -> bool:
 
 # Canonical service buckets: canonical_label -> list of raw strings to match (lowercase)
 CANONICAL_SERVICE_BUCKETS: Dict[str, List[str]] = {
-    "implants": ["implant", "dental implant", "implants"],
-    "orthodontics": ["orthodontic", "orthodontics", "invisalign", "braces"],
-    "veneers": ["veneer", "veneers"],
-    "emergency": ["emergency", "emergency dental"],
-    "cosmetic": ["cosmetic", "cosmetic dentistry"],
+    "implants": ["implant", "dental implant", "implants", "dental implants", "all-on-4", "all on 4"],
+    "orthodontics": ["orthodontic", "orthodontics", "invisalign", "braces", "clear aligner", "clear aligners"],
+    "veneers": ["veneer", "veneers", "porcelain veneer", "porcelain veneers"],
+    "emergency": ["emergency", "emergency dental", "emergency dentist", "same day", "same-day", "urgent dental"],
+    "cosmetic": ["cosmetic", "cosmetic dentistry", "smile makeover", "teeth whitening", "whitening"],
+    "sedation": ["sedation", "sedation dentistry", "iv sedation", "nitrous", "nitrous oxide", "oral sedation", "sleep dentistry"],
+    "crowns": ["crown", "crowns", "same day crown", "same-day crown", "dental crown", "dental crowns"],
+    "sleep apnea": ["sleep apnea", "sleep-apnea", "snoring"],
 }
-CANONICAL_ORDER = ["Implants", "Orthodontics", "Veneers", "Emergency", "Cosmetic"]
+CANONICAL_ORDER = ["Implants", "Orthodontics", "Veneers", "Emergency", "Cosmetic", "Sedation", "Crowns", "Sleep Apnea"]
 
 # Bottleneck snake_case -> Title Case
 BOTTLENECK_TO_LABEL: Dict[str, str] = {
@@ -52,18 +55,28 @@ BOTTLENECK_TO_LEVERAGE: Dict[str, str] = {
 # Primary service for revenue upside section: priority order (first match from missing_high_value_pages wins)
 PRIMARY_SERVICE_PRIORITY: List[Tuple[str, str]] = [
     ("implants", "Implants"),
+    ("orthodontics", "Orthodontics"),
     ("invisalign", "Invisalign"),
     ("orthodontic", "Orthodontic"),
     ("veneers", "Veneers"),
     ("cosmetic", "Cosmetic"),
+    ("sedation", "Sedation"),
+    ("crowns", "Crowns"),
+    ("sleep apnea", "Sleep Apnea"),
+    ("emergency", "Emergency"),
 ]
 # Case value proxy (low, high) per canonical key for revenue breakdown — tight deterministic bands
 PRIMARY_SERVICE_CASE_VALUE: Dict[str, Tuple[int, int]] = {
     "implants": (4000, 6000),
+    "orthodontics": (3500, 5500),
     "invisalign": (3500, 5500),
     "orthodontic": (3500, 5500),
     "veneers": (3000, 5000),
     "cosmetic": (3000, 5000),
+    "sedation": (2000, 4000),
+    "crowns": (1500, 3000),
+    "sleep apnea": (2000, 4000),
+    "emergency": (1000, 2500),
 }
 # Consult range (low, high) per traffic_estimate_tier — max spread 2x
 TRAFFIC_TIER_CONSULTS: Dict[str, Tuple[int, int]] = {
@@ -189,6 +202,120 @@ def compute_paid_demand_status(lead: Dict[str, Any]) -> Dict[str, str]:
         if runs_meta:
             return {"status": "Active (Meta)", "interpretation": "Practice has Meta ads presence."}
         return {}
+    except Exception:
+        return {}
+
+
+def compute_organic_visibility(lead: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Deterministic organic visibility tier relative to the local market.
+
+    Replaces fabricated numeric traffic ranges with a qualitative assessment
+    anchored to competitive context and observable signals.
+
+    Returns {"tier": "High"|"Moderate"|"Low", "reason": "..."} or {} if data missing.
+    """
+    try:
+        cs = lead.get("competitive_snapshot") or {}
+        oi = lead.get("objective_intelligence") or {}
+        svc = oi.get("service_intel") or lead.get("service_intelligence") or {}
+
+        if lead.get("signals") and isinstance(lead["signals"], dict):
+            signals = lead["signals"]
+        else:
+            signals = {k: v for k, v in lead.items() if k.startswith("signal_") or k in ("user_ratings_total", "rating")}
+
+        review_count = (
+            signals.get("signal_review_count")
+            or signals.get("user_ratings_total")
+            or cs.get("lead_review_count")
+            or 0
+        )
+        try:
+            review_count = int(review_count)
+        except (TypeError, ValueError):
+            review_count = 0
+
+        avg_reviews = cs.get("avg_review_count") or 0
+        try:
+            avg_reviews = float(avg_reviews)
+        except (TypeError, ValueError):
+            avg_reviews = 0
+
+        has_website = signals.get("signal_has_website") is True
+        has_service_pages = bool(
+            svc.get("high_ticket_procedures_detected")
+            or svc.get("high_ticket_services_detected")
+        )
+        missing_pages = svc.get("missing_high_value_pages") or []
+        has_all_service_pages = has_service_pages and len(missing_pages) == 0
+        has_schema = signals.get("signal_has_schema_microdata") is True
+        runs_ads = signals.get("signal_runs_paid_ads") is True
+        pages_crawled = svc.get("pages_crawled") or 0
+
+        if not has_website:
+            return {"tier": "Low", "reason": "No website detected in Google listing"}
+
+        # Count positive signals for tiering
+        positive = 0
+        reasons_high: List[str] = []
+        reasons_mod: List[str] = []
+        reasons_low: List[str] = []
+
+        if avg_reviews > 0 and review_count >= avg_reviews:
+            positive += 2
+            reasons_high.append("review authority at or above local average")
+        elif avg_reviews > 0 and review_count >= avg_reviews * 0.3:
+            positive += 1
+            reasons_mod.append("moderate review presence relative to market")
+        else:
+            reasons_low.append("review count below local market average")
+
+        if has_all_service_pages:
+            positive += 2
+            reasons_high.append("dedicated service pages for high-ticket procedures")
+        elif has_service_pages:
+            positive += 1
+            reasons_mod.append("some high-ticket services detected but missing dedicated pages")
+
+        if has_schema:
+            positive += 1
+            reasons_high.append("schema markup present")
+        else:
+            reasons_low.append("no schema markup detected")
+
+        if pages_crawled >= 50:
+            positive += 1
+            reasons_high.append(f"{pages_crawled} indexed pages")
+        elif pages_crawled >= 15:
+            reasons_mod.append(f"{pages_crawled} indexed pages")
+
+        if runs_ads:
+            positive += 1
+            reasons_mod.append("active paid campaigns supplementing organic")
+
+        # Classification
+        if positive >= 5:
+            tier = "High"
+            reason_parts = reasons_high[:3] or reasons_mod[:2]
+        elif positive >= 2:
+            tier = "Moderate"
+            reason_parts = reasons_mod[:3] or reasons_high[:1] or reasons_low[:2]
+        else:
+            tier = "Low"
+            reason_parts = reasons_low[:3] or reasons_mod[:1]
+
+        if not reason_parts:
+            reason_parts = ["limited public signals available"]
+
+        market_ctx = ""
+        density = cs.get("market_density_score") or ""
+        if density:
+            market_ctx = f" in a {density} density market"
+
+        reason = ". ".join(r.capitalize() for r in reason_parts) + market_ctx
+
+        return {"tier": tier, "reason": reason}
     except Exception:
         return {}
 
@@ -348,9 +475,14 @@ def _normalize_to_canonical_services(
         if b:
             missing_set.add(b)
 
-    order_keys = [k for k in ["implants", "orthodontics", "veneers", "emergency", "cosmetic"]]
-    detected_list = [k.capitalize() for k in order_keys if k in detected_set]
-    missing_list = [k.capitalize() for k in order_keys if k in missing_set]
+    order_keys = ["implants", "orthodontics", "veneers", "emergency", "cosmetic", "sedation", "crowns", "sleep apnea"]
+    display_map = {
+        "implants": "Implants", "orthodontics": "Orthodontics", "veneers": "Veneers",
+        "emergency": "Emergency", "cosmetic": "Cosmetic", "sedation": "Sedation",
+        "crowns": "Crowns", "sleep apnea": "Sleep Apnea",
+    }
+    detected_list = [display_map[k] for k in order_keys if k in detected_set]
+    missing_list = [display_map[k] for k in order_keys if k in missing_set]
     return (detected_list, missing_list)
 
 
@@ -505,7 +637,7 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
     if density:
         vm["market_position"]["market_density"] = str(density)
 
-    # ---------- 2b) Competitive Context (SEO for dentists: local visibility, competitors) ----------
+    # ---------- 2b) Competitive Context (local visibility, competitors) ----------
     cp = (oi.get("competitive_profile") or {}) if oi else {}
     if cp.get("dentists_sampled") or comp.get("dentists_sampled"):
         n = int(cp.get("dentists_sampled") or comp.get("dentists_sampled") or 0)
@@ -519,7 +651,7 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
         nearest = cp.get("nearest_competitors") or (comp.get("competitor_summary") or {}).get("nearest_competitors") or []
         if n or radius is not None:
             vm["competitive_context"]["line1"] = (
-                f"{n} dentists sampled within {radius} mi · "
+                f"{n} practices sampled within {radius} mi · "
                 + (f"Avg reviews {float(avg_reviews):.0f}" if avg_reviews is not None else "Avg reviews —")
                 + " · "
                 + (f"Avg rating {float(avg_rating_val):.1f}" if avg_rating_val is not None and avg_rating_val != 0 else "Avg rating —")
@@ -558,34 +690,56 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
     channels_lower = [str(c).strip().lower() for c in channels if c]
     runs_google = signals.get("signal_runs_paid_ads") is True and "google" in channels_lower
     runs_meta = "meta" in channels_lower
-    vm["demand_signals"]["google_ads_line"] = (
-        "Active (Search campaigns detected)" if runs_google else "Not detected"
-    )
+
+    google_ads_line = "Not detected"
+    gads_api = lead.get("google_ads_api_data")
+    if gads_api and gads_api.get("total_spend_usd", 0) > 0:
+        spend = gads_api["total_spend_usd"]
+        clicks = gads_api.get("total_clicks", 0)
+        google_ads_line = f"Active (${spend:,.0f}/mo · {clicks:,} clicks)"
+        runs_google = True
+    elif runs_google:
+        gads_check = signals.get("google_ads_check") or {}
+        gads_conv_ids = gads_check.get("google_ads_conversion_ids") or []
+        gads_confidence = gads_check.get("confidence", "")
+        if gads_conv_ids:
+            google_ads_line = "Active (Conversion tracking confirmed)"
+        elif gads_confidence == "high":
+            google_ads_line = "Active (Multiple tracking signals)"
+        else:
+            google_ads_line = "Active (Paid spend detected)"
+    vm["demand_signals"]["google_ads_line"] = google_ads_line
     vm["demand_signals"]["meta_ads_line"] = "Active" if runs_meta else "Not detected"
-    traffic_range = rev.get("traffic_estimate_range")
-    if isinstance(traffic_range, dict):
-        lo = traffic_range.get("lower") or traffic_range.get("low")
-        hi = traffic_range.get("upper") or traffic_range.get("high")
-        if lo is not None and hi is not None:
-            vm["demand_signals"]["estimated_traffic"] = f"{lo}–{hi}"
-    if not vm["demand_signals"].get("estimated_traffic"):
-        traffic_monthly = rev.get("traffic_estimate_monthly")
-        if not traffic_monthly and s60 and s60.get("traffic_estimate"):
-            traffic_monthly = (s60["traffic_estimate"] or {}).get("traffic_estimate_monthly")
-        if isinstance(traffic_monthly, dict):
-            lo, hi = traffic_monthly.get("lower"), traffic_monthly.get("upper")
-            if lo is not None and hi is not None:
-                vm["demand_signals"]["estimated_traffic"] = f"{lo}–{hi}"
+    real_paid_spend = signals.get("signal_real_paid_spend")
+    if real_paid_spend is not None and real_paid_spend > 0:
+        vm["demand_signals"]["paid_spend_estimate"] = f"~${int(real_paid_spend):,}/mo"
+    else:
+        paid_spend = rev.get("paid_spend_range_estimate")
+        if paid_spend and paid_spend != "Not detected":
+            vm["demand_signals"]["paid_spend_estimate"] = paid_spend
+        elif runs_google and not (paid_spend and paid_spend != "Not detected"):
+            vm["demand_signals"]["paid_spend_estimate"] = "$3k–$10k"
+    visibility = compute_organic_visibility(lead)
+    if visibility:
+        vm["demand_signals"]["organic_visibility_tier"] = visibility.get("tier", "")
+        vm["demand_signals"]["organic_visibility_reason"] = visibility.get("reason", "")
     last_rev = lead.get("days_since_last_review")
     if last_rev is None:
         last_rev = signals.get("signal_last_review_days_ago")
     if last_rev is not None:
         vm["demand_signals"]["last_review_days_ago"] = last_rev
-    vel = lead.get("review_velocity_last_30_days")
-    if vel is None:
-        vel = signals.get("signal_review_velocity_30d")
-    if vel is not None:
-        vm["demand_signals"]["review_velocity_30d"] = vel
+        vm["demand_signals"]["last_review_estimated"] = True
+    real_vel = lead.get("signal_real_review_velocity_30d")
+    if real_vel is not None:
+        vm["demand_signals"]["review_velocity_30d"] = real_vel
+        vm["demand_signals"]["review_velocity_estimated"] = False
+    else:
+        vel = lead.get("review_velocity_last_30_days")
+        if vel is None:
+            vel = signals.get("signal_review_velocity_30d")
+        if vel is not None:
+            vm["demand_signals"]["review_velocity_30d"] = vel
+            vm["demand_signals"]["review_velocity_estimated"] = True
 
     # ---------- 4) High-Ticket Capture Gaps (canonical normalization) ----------
     svc = obj.get("service_intelligence") or {}
@@ -634,6 +788,22 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
                     pass
 
             annual_low = min(annual_low, annual_high)  # ensure annual_low <= annual_high
+
+            upside_source = "proxy_model"
+            ga4_data = lead.get("ga4_data")
+            if ga4_data and ga4_data.get("total_sessions", 0) > 0:
+                ga4_conversions = sum(ga4_data.get("conversions", {}).values())
+                ga4_sessions = ga4_data["total_sessions"]
+                if ga4_sessions > 100 and ga4_conversions > 0:
+                    conv_rate = ga4_conversions / ga4_sessions
+                    estimated_additional = int(ga4_sessions * 0.15 * conv_rate * 12)
+                    if estimated_additional > 0:
+                        annual_low = estimated_additional * case_low
+                        annual_high = estimated_additional * case_high
+                        consult_low = max(1, estimated_additional // 12)
+                        consult_high = max(consult_low + 1, int(estimated_additional * 1.3) // 12)
+                        upside_source = "ga4_calibrated"
+
             vm["revenue_upside_capture_gap"] = {
                 "primary_service": display_name,
                 "consult_low": consult_low,
@@ -642,6 +812,7 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
                 "case_high": case_high,
                 "annual_low": annual_low,
                 "annual_high": annual_high,
+                "source": upside_source,
             }
 
     # ---------- 5) Conversion Infrastructure ----------
@@ -699,14 +870,27 @@ def build_revenue_brief_view_model(lead: Dict[str, Any]) -> Dict[str, Any]:
                         part += f" (Time to signal: {days}d)"
                     steps.append(part)
     if steps:
-        # Dental only: dynamically calibrate Step 3 based on Paid Demand Status
+        # Dental only: calibrate Step 3 based on actual infrastructure
         if _is_dental_for_brief(lead) and len(steps) >= 3:
             paid_status = compute_paid_demand_status(lead)
             status = (paid_status or {}).get("status", "Inactive")
+            has_booking = signals.get("signal_has_automated_scheduling") is True
+            has_schema_val = signals.get("signal_has_schema_microdata")
+
             if status in ("Active (Search)", "Active (Search + Meta)", "Aggressive Search Presence"):
-                step3 = "Step 3 — Paid Alignment: Align Google Ads traffic to service-specific landing page and verify conversion tracking integrity."
+                if missing_canonical:
+                    first_svc = missing_canonical[0] if missing_canonical else "high-value service"
+                    step3 = f"Step 3 — Paid Alignment: Route existing Google Ads traffic to a dedicated {first_svc} landing page with conversion tracking. (Time to signal: 15d)"
+                else:
+                    step3 = "Step 3 — Paid Alignment: Audit existing Google Ads campaigns for keyword-to-landing-page alignment and conversion tracking integrity. (Time to signal: 15d)"
+            elif has_booking and has_schema_val is True:
+                step3 = "Step 3 — Demand Activation: Launch a controlled paid search test targeting the highest-value missing service keyword with a dedicated landing page. (Time to signal: 30d)"
+            elif not has_booking:
+                step3 = "Step 3 — Conversion: Add online booking functionality to reduce intake friction and capture high-intent visitors. (Time to signal: 20d)"
+            elif has_schema_val is not True:
+                step3 = "Step 3 — Trust: Implement LocalBusiness and Service schema markup to improve local search visibility and click-through rates. (Time to signal: 15d)"
             else:
-                step3 = "Step 3 — Demand Activation: Launch controlled paid search test targeting high-intent service keywords."
+                step3 = "Step 3 — Demand Activation: Launch a controlled paid search test targeting high-intent service keywords. (Time to signal: 30d)"
             steps = steps[:2] + [step3]
         vm["intervention_plan"] = steps
     else:
@@ -791,7 +975,7 @@ def render_revenue_brief_html(lead: Dict[str, Any], title: str = "Revenue Intell
                 + "\n</section>"
             )
 
-    # 2b) Competitive Context (local SEO: dentists sampled, lead vs competitors, nearest 3)
+    # 2b) Competitive Context (practices sampled, lead vs competitors, nearest 3)
     cc = vm.get("competitive_context") or {}
     if cc.get("line1") or cc.get("line2") or cc.get("line3"):
         parts = []
@@ -839,12 +1023,17 @@ def render_revenue_brief_html(lead: Dict[str, Any], title: str = "Revenue Intell
         ds_parts.append(f"<p><strong>Google Ads:</strong> {_h(ds['google_ads_line'])}</p>")
     if ds.get("meta_ads_line"):
         ds_parts.append(f"<p><strong>Meta Ads:</strong> {_h(ds['meta_ads_line'])}</p>")
-    if ds.get("estimated_traffic"):
-        ds_parts.append(f"<p><strong>Estimated Traffic:</strong> {_h(ds['estimated_traffic'])}</p>")
+    if ds.get("organic_visibility_tier"):
+        vis_line = f"{_h(ds['organic_visibility_tier'])}"
+        if ds.get("organic_visibility_reason"):
+            vis_line += f" — {_h(ds['organic_visibility_reason'])}"
+        ds_parts.append(f"<p><strong>Organic Visibility:</strong> {vis_line}</p>")
     if ds.get("last_review_days_ago") is not None:
-        ds_parts.append(f"<p><strong>Last Review:</strong> {_h(ds['last_review_days_ago'])} days ago</p>")
+        est = " (estimated)" if ds.get("last_review_estimated") else ""
+        ds_parts.append(f"<p><strong>Last Review:</strong> ~{_h(ds['last_review_days_ago'])} days ago{est}</p>")
     if ds.get("review_velocity_30d") is not None:
-        ds_parts.append(f"<p><strong>Review Velocity:</strong> {_h(ds['review_velocity_30d'])} in last 30 days</p>")
+        est = " (estimated)" if ds.get("review_velocity_estimated") else ""
+        ds_parts.append(f"<p><strong>Review Velocity:</strong> ~{_h(ds['review_velocity_30d'])} in last 30 days{est}</p>")
     if ds_parts:
         sections.append(
             "<section class=\"brief-section brief-demand\">\n  <h2>Demand Signals</h2>\n  "

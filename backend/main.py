@@ -2,17 +2,35 @@
 FastAPI backend for lead scoring engine.
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.middleware.auth import FakeAuthMiddleware
 from backend.routes.diagnostic import router as diagnostic_router
+from backend.routes.jobs import router as jobs_router
+from backend.routes.diagnostics import router as diagnostics_router
+from backend.routes.outcomes import router as outcomes_router
+from backend.services.job_worker import start_worker, stop_worker
+from pipeline.db import init_db
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    start_worker()
+    yield
+    stop_worker()
+
 
 app = FastAPI(
     title="Lead Scoring Engine API",
     description="Diagnostic endpoint for business lead enrichment",
-    version="1.0.0",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
+app.add_middleware(FakeAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -22,14 +40,12 @@ app.add_middleware(
 )
 
 app.include_router(diagnostic_router)
+app.include_router(jobs_router)
+app.include_router(diagnostics_router)
+app.include_router(outcomes_router)
 
 
 @app.get("/health")
 def health():
     """Health check endpoint."""
     return {"status": "ok"}
-
-
-# Mount POST /diagnostic at root path as well for convenience
-# The router has prefix="/diagnostic", so POST /diagnostic/diagnostic would be wrong.
-# Actually the router prefix is /diagnostic, and the route is "" so the full path is POST /diagnostic. Good.

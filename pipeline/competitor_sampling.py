@@ -272,7 +272,7 @@ def build_competitive_snapshot(
     density = out["market_density_score"]
     radius = out.get("search_radius_used_miles") or 2
     out["competitive_context_summary"] = (
-        f"{lead_count} reviews vs {avg_rev:.0f} local avg across {n} dentists within {radius} miles. "
+        f"{lead_count} reviews vs {avg_rev:.0f} local avg across {n} practices within {radius} miles. "
         f"Market is {density}. Review tier: {tier}."
     )
 

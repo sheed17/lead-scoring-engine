@@ -18,24 +18,34 @@ def _get_review_count(context: Dict) -> int:
 
 
 def _base_revenue_band(review_count: int) -> Tuple[int, int]:
-    """Tier-based annual revenue band (lower, upper) in USD. Not linear in review count."""
-    if review_count < 30:
-        return (400_000, 900_000)
-    if review_count < 150:
-        return (900_000, 1_800_000)
-    if review_count < 400:
-        return (1_500_000, 2_800_000)
-    return (2_500_000, 4_000_000)
+    """Tier-based annual revenue band (lower, upper) in USD.
+
+    More granular tiers based on dental industry benchmarks:
+    Reviews correlate with years in practice, patient volume, and provider count.
+    """
+    if review_count <= 10:
+        return (300_000, 600_000)
+    if review_count <= 30:
+        return (500_000, 1_000_000)
+    if review_count <= 75:
+        return (800_000, 1_500_000)
+    if review_count <= 150:
+        return (1_200_000, 2_100_000)
+    if review_count <= 300:
+        return (1_800_000, 3_000_000)
+    if review_count <= 500:
+        return (2_500_000, 4_000_000)
+    return (3_000_000, 5_000_000)
 
 
 def _high_ticket_emphasized(high_ticket_procedures: List[Any]) -> bool:
-    """True if implants or invisalign explicitly present (high-ticket emphasis)."""
+    """True if implants, orthodontics, or veneers explicitly present (high-ticket emphasis)."""
     if not high_ticket_procedures:
         return False
     for p in high_ticket_procedures:
         s = (p.get("procedure") if isinstance(p, dict) else p) or ""
         s = str(s).lower()
-        if "implant" in s or "invisalign" in s:
+        if any(kw in s for kw in ("implant", "invisalign", "orthodontic", "veneer", "cosmetic")):
             return True
     return False
 
@@ -47,6 +57,9 @@ def _apply_revenue_adjustments(
     multiple_locations: bool,
     staff_count: Optional[int],
     high_income_metro: bool = False,
+    ads_active: bool = False,
+    rating: Optional[float] = None,
+    review_count: int = 0,
 ) -> Tuple[int, int]:
     """Apply proportional adjustments. Each modifier adds a percentage to the band."""
     mult = 1.0
@@ -54,10 +67,16 @@ def _apply_revenue_adjustments(
         mult += 0.15
     if multiple_locations:
         mult += 0.20
-    if staff_count is not None and staff_count >= 3:
+    if staff_count is not None and staff_count >= 5:
+        mult += 0.15
+    elif staff_count is not None and staff_count >= 3:
         mult += 0.10
     if high_income_metro:
         mult += 0.10
+    if ads_active:
+        mult += 0.10
+    if rating is not None and rating >= 4.5 and review_count >= 50:
+        mult += 0.05
     return (int(round(lower * mult, 0)), int(round(upper * mult, 0)))
 
 
@@ -164,8 +183,15 @@ def compute_revenue_v2(
         multiple_locations = (dentist_profile.get("operations") or {}).get("multiple_locations") is True
 
     high_ticket_emph = _high_ticket_emphasized(high_ticket)
+    rating = context.get("signal_rating")
+    if rating is not None:
+        try:
+            rating = float(rating)
+        except (TypeError, ValueError):
+            rating = None
     low, upp = _apply_revenue_adjustments(
-        low, upp, high_ticket_emph, multiple_locations, staff_count, high_income_metro
+        low, upp, high_ticket_emph, multiple_locations, staff_count, high_income_metro,
+        ads_active=ads_active, rating=rating, review_count=review_count,
     )
     # Floor: no unrealistic revenue under floor for operating dentist
     low = max(low, REVENUE_FLOOR_LOWER)

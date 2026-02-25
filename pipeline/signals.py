@@ -69,10 +69,29 @@ AUTOMATED_SCHEDULING_PATTERNS = [
     r'lumahealth\.io',
     r'weave\.com',
     r'demandforce\.com',
+    r'dentrix\.com',
+    r'curvedental\.com',
+    r'opendental\.com',
+    r'denticon\.com',
+    r'carestack\.com',
+    r'tab32\.com',
+    r'revenuewell\.com',
+    r'yapi\.com',
+    r'lighthouse360\.com',
+    r'pb\.dental',
+    r'flexbook\.me',
+    r'getweave\.com',
+    r'modento\.io',
+    r'kleer\.com',
+    r'dentalhq\.com',
     
-    # Booking platforms (less common for HVAC)
+    # Booking platforms (general)
     r'booksy\.com',
     r'vagaro\.com',
+    r'mindbody\.com',
+    r'mindbodyonline\.com',
+    r'jane\.app',
+    r'intakeq\.com',
 ]
 
 # Booking conversion path (dentist-realistic): detect path type from page
@@ -802,14 +821,40 @@ def _analyze_html_content(html: str) -> Dict:
         email_address = None
     
     # =========================================================================
-    # AUTOMATED SCHEDULING: Operational maturity signal
+    # AUTOMATED SCHEDULING: Online booking detection
     # =========================================================================
-    has_scheduling_evidence = any(
+    has_scheduling_platform = any(
         re.search(pattern, html_lower, re.IGNORECASE)
         for pattern in AUTOMATED_SCHEDULING_PATTERNS
     )
-    
-    if has_scheduling_evidence:
+
+    # Detect booking CTAs and links to booking subdomains/pages
+    has_full_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_FULL) if has_substantial_html else False
+    has_request_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_REQUEST) if has_substantial_html else False
+    has_phone_only_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_PHONE_ONLY) if has_substantial_html else False
+
+    # Check for booking links to subdomains (book.*, schedule.*, appointment.*)
+    has_booking_subdomain_link = False
+    if has_substantial_html:
+        booking_link_patterns = [
+            r'href\s*=\s*["\']https?://book\.',
+            r'href\s*=\s*["\']https?://schedule\.',
+            r'href\s*=\s*["\']https?://appointment\.',
+            r'href\s*=\s*["\']https?://booking\.',
+            r'href\s*=\s*["\']https?://app\.[^"\']*(?:book|schedul|appoint)',
+        ]
+        has_booking_subdomain_link = any(
+            re.search(p, html_lower, re.IGNORECASE)
+            for p in booking_link_patterns
+        )
+
+    # Online booking = recognized platform OR booking CTA with link evidence
+    has_automated_scheduling: bool | None
+    if has_scheduling_platform:
+        has_automated_scheduling = True
+    elif has_full_cta and has_booking_subdomain_link:
+        has_automated_scheduling = True
+    elif has_full_cta:
         has_automated_scheduling = True
     elif has_substantial_html:
         has_automated_scheduling = False
@@ -821,16 +866,13 @@ def _analyze_html_content(html: str) -> Dict:
     # =========================================================================
     booking_conversion_path = None
     if has_substantial_html:
-        has_full_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_FULL)
-        has_request_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_REQUEST)
-        has_phone_only_cta = any(re.search(p, html_lower) for p in BOOKING_CONVERSION_PATH_PHONE_ONLY)
-        if has_scheduling_evidence and has_full_cta:
+        if has_automated_scheduling and has_full_cta:
             booking_conversion_path = "Online booking (full)"
-        elif has_scheduling_evidence:
+        elif has_automated_scheduling:
             booking_conversion_path = "Online booking (limited)"
-        elif has_request_cta or (has_contact_form and not has_scheduling_evidence):
+        elif has_request_cta or (has_contact_form and not has_automated_scheduling):
             booking_conversion_path = "Request form"
-        elif has_phone_only_cta or (not has_contact_form and not has_scheduling_evidence):
+        elif has_phone_only_cta or (not has_contact_form and not has_automated_scheduling):
             booking_conversion_path = "Phone-only"
     
     # =========================================================================
@@ -1024,6 +1066,13 @@ def analyze_website(url: str) -> Dict:
         signals["has_phone_in_html"] = content_signals["has_phone_in_html"]
         signals["has_address_in_html"] = content_signals["has_address_in_html"]
         signals["linkedin_company_url"] = content_signals["linkedin_company_url"]
+
+        # Headless browser enhancement: render JS and upgrade null/false signals
+        try:
+            from pipeline.headless_browser import enhance_signals as _headless_enhance
+            signals = _headless_enhance(url, signals)
+        except Exception as exc:
+            logger.debug("Headless enhancement skipped: %s", exc)
     else:
         # Could not retrieve HTML - site is not accessible
         # We KNOW it's not accessible (confident false)
@@ -1124,7 +1173,8 @@ def extract_signals(lead: Dict) -> Dict:
     
     # Extract review signals
     reviews = details.get("reviews", [])
-    review_count = lead.get("user_ratings_total", 0) or len(reviews)
+    urt = lead.get("user_ratings_total")
+    review_count = int(urt) if urt is not None and urt != 0 else len(reviews)
     rating = lead.get("rating")
     last_review_days_ago = calculate_days_since_review(reviews)
     

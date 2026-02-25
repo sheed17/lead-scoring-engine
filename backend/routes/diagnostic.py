@@ -1,54 +1,38 @@
 """
-POST /diagnostic route.
+POST /diagnostic — submit async diagnostic job.
 """
 
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
-from backend.models.schemas import DiagnosticRequest, DiagnosticResponse, InterventionPlanItem
-from backend.services.enrichment_service import run_diagnostic
+from backend.models.schemas import DiagnosticRequest, JobSubmitResponse
+from pipeline.db import create_job
 
 router = APIRouter(prefix="/diagnostic", tags=["diagnostic"])
+logger = logging.getLogger(__name__)
 
 
-@router.post("", response_model=DiagnosticResponse)
-def post_diagnostic(body: DiagnosticRequest):
+@router.post("", response_model=JobSubmitResponse)
+def post_diagnostic(body: DiagnosticRequest, request: Request):
     """
-    Run diagnostic enrichment on a business.
-
-    Required: business_name, city
-    Optional: website
+    Submit a diagnostic job. Returns immediately with a job_id.
+    Poll GET /jobs/{job_id} for status.
     """
+    user_id = getattr(request.state, "user_id", 1)
+
     try:
-        result = run_diagnostic(
-            business_name=body.business_name.strip(),
-            city=body.city.strip(),
-            website=body.website.strip() if body.website else None,
+        job_id = create_job(
+            user_id=user_id,
+            job_type="diagnostic",
+            input_data={
+                "business_name": body.business_name.strip(),
+                "city": body.city.strip(),
+                "state": body.state.strip(),
+                "website": body.website.strip() if body.website else None,
+            },
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Business not found")
-    except RuntimeError:
-        raise HTTPException(status_code=500, detail="Pipeline or API error")
     except Exception as e:
-        logging.getLogger(__name__).exception("Diagnostic failed: %s", e)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.exception("Failed to create job: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create job")
 
-    # Convert intervention_plan dicts to Pydantic models
-    plan = [
-        InterventionPlanItem(step=item["step"], category=item["category"], action=item["action"])
-        for item in result.get("intervention_plan", [])
-    ]
-    return DiagnosticResponse(
-        lead_id=result["lead_id"],
-        business_name=result["business_name"],
-        city=result["city"],
-        opportunity_profile=result["opportunity_profile"],
-        constraint=result["constraint"],
-        primary_leverage=result["primary_leverage"],
-        market_density=result["market_density"],
-        review_position=result["review_position"],
-        paid_status=result["paid_status"],
-        intervention_plan=plan,
-    )
+    return JobSubmitResponse(job_id=job_id, status="pending")

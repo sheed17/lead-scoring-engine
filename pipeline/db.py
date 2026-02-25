@@ -138,6 +138,63 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (lead_id) REFERENCES leads(id)
             );
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                type TEXT NOT NULL DEFAULT 'diagnostic',
+                status TEXT NOT NULL DEFAULT 'pending',
+                input_json TEXT,
+                result_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                job_id TEXT,
+                place_id TEXT,
+                business_name TEXT NOT NULL,
+                city TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT '',
+                brief_json TEXT,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS review_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                place_id TEXT NOT NULL,
+                review_count INTEGER NOT NULL,
+                rating REAL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_snapshots_place ON review_snapshots(place_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS diagnostic_predictions (
+                diagnostic_id INTEGER PRIMARY KEY,
+                place_id TEXT NOT NULL,
+                predictions_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS diagnostic_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                diagnostic_id INTEGER NOT NULL,
+                outcome_type TEXT NOT NULL,
+                outcome_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (diagnostic_id) REFERENCES diagnostics(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_outcomes_diagnostic ON diagnostic_outcomes(diagnostic_id);
+            CREATE INDEX IF NOT EXISTS idx_predictions_place ON diagnostic_predictions(place_id);
+
+            CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+            CREATE INDEX IF NOT EXISTS idx_diagnostics_user ON diagnostics(user_id);
         """)
         conn.commit()
         # Optional columns (migration for existing DBs)
@@ -151,6 +208,7 @@ def init_db() -> None:
             "ALTER TABLE leads ADD COLUMN llm_reasoning_layer_json TEXT",
             "ALTER TABLE leads ADD COLUMN sales_intervention_intelligence_json TEXT",
             "ALTER TABLE leads ADD COLUMN objective_decision_layer_json TEXT",
+            "ALTER TABLE diagnostics ADD COLUMN state TEXT",
         ]:
             try:
                 conn.execute(sql)
@@ -986,3 +1044,245 @@ def get_leads_with_decisions_deduped_by_place_id(limit_runs: int = 10) -> List[D
             if pid and pid not in by_place:
                 by_place[pid] = lead
     return list(by_place.values())
+
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+
+def create_job(user_id: int, job_type: str, input_data: Dict) -> str:
+    """Create a pending job; return job_id (UUID)."""
+    init_db()
+    job_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO jobs (id, user_id, type, status, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, user_id, job_type, "pending", json.dumps(input_data, default=str), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return job_id
+
+
+def get_job(job_id: str) -> Optional[Dict]:
+    """Return job dict or None."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("input_json"):
+            d["input"] = json.loads(d["input_json"])
+        if d.get("result_json"):
+            d["result"] = json.loads(d["result_json"])
+        return d
+    finally:
+        conn.close()
+
+
+def update_job_status(job_id: str, status: str, result: Optional[Dict] = None, error: Optional[str] = None) -> None:
+    """Update job status, optionally storing result or error."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        if result is not None:
+            conn.execute(
+                "UPDATE jobs SET status = ?, result_json = ?, completed_at = ? WHERE id = ?",
+                (status, json.dumps(result, default=str), now, job_id),
+            )
+        elif error is not None:
+            conn.execute(
+                "UPDATE jobs SET status = ?, error = ?, completed_at = ? WHERE id = ?",
+                (status, error, now, job_id),
+            )
+        else:
+            conn.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_jobs(limit: int = 10) -> List[Dict]:
+    """Return oldest pending jobs."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            if d.get("input_json"):
+                d["input"] = json.loads(d["input_json"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics (SaaS layer)
+# ---------------------------------------------------------------------------
+
+def save_diagnostic(user_id: int, job_id: Optional[str], place_id: Optional[str],
+                    business_name: str, city: str, brief: Optional[Dict],
+                    response: Dict, state: Optional[str] = None) -> int:
+    """Save a completed diagnostic; return diagnostic_id."""
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            """INSERT INTO diagnostics (user_id, job_id, place_id, business_name, city,
+               state, brief_json, response_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id, job_id, place_id, business_name, city, state,
+                json.dumps(brief, default=str) if brief else None,
+                json.dumps(response, default=str), now,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def list_diagnostics(user_id: int, limit: int = 50, offset: int = 0) -> List[Dict]:
+    """Return diagnostics for a user, newest first."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM diagnostics WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
+        ).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            if d.get("response_json"):
+                d["response"] = json.loads(d["response_json"])
+            if d.get("brief_json"):
+                d["brief"] = json.loads(d["brief_json"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def get_diagnostic(diagnostic_id: int, user_id: int) -> Optional[Dict]:
+    """Return a single diagnostic owned by user_id, or None."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM diagnostics WHERE id = ? AND user_id = ?",
+            (diagnostic_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("response_json"):
+            d["response"] = json.loads(d["response_json"])
+        if d.get("brief_json"):
+            d["brief"] = json.loads(d["brief_json"])
+        return d
+    finally:
+        conn.close()
+
+
+def delete_diagnostic(diagnostic_id: int, user_id: int) -> bool:
+    """Delete a diagnostic owned by user_id. Returns True if deleted."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "DELETE FROM diagnostics WHERE id = ? AND user_id = ?",
+            (diagnostic_id, user_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def count_diagnostics(user_id: int) -> int:
+    """Return total diagnostics for a user."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM diagnostics WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return row["cnt"] if row else 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Review Snapshots (for real velocity calculation)
+# ---------------------------------------------------------------------------
+
+def save_review_snapshot(place_id: str, review_count: int, rating: Optional[float] = None) -> None:
+    """Store a point-in-time review count for a place. Called after each diagnostic run."""
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO review_snapshots (place_id, review_count, rating, created_at) VALUES (?, ?, ?, ?)",
+            (place_id, review_count, rating, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_review_velocity(place_id: str, window_days: int = 30) -> Optional[Dict]:
+    """
+    Calculate real review velocity from stored snapshots.
+
+    Compares the current review count to the oldest snapshot within
+    the window to compute actual reviews gained over time.
+
+    Returns None if no prior snapshots exist (first run for this place).
+    Returns dict with velocity_per_30d, delta, days_between, snapshots_count.
+    """
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT review_count, rating, created_at
+               FROM review_snapshots
+               WHERE place_id = ?
+               ORDER BY created_at ASC""",
+            (place_id,),
+        ).fetchall()
+
+        if len(rows) < 2:
+            return None
+
+        oldest = rows[0]
+        newest = rows[-1]
+
+        oldest_dt = datetime.fromisoformat(oldest["created_at"].replace("Z", "+00:00"))
+        newest_dt = datetime.fromisoformat(newest["created_at"].replace("Z", "+00:00"))
+
+        days_between = (newest_dt - oldest_dt).total_seconds() / 86400
+        if days_between < 1:
+            return None
+
+        delta = newest["review_count"] - oldest["review_count"]
+        velocity_per_30d = round((delta / days_between) * 30, 1) if days_between > 0 else 0
+
+        return {
+            "velocity_per_30d": velocity_per_30d,
+            "delta": delta,
+            "days_between": round(days_between, 1),
+            "snapshots_count": len(rows),
+            "oldest_count": oldest["review_count"],
+            "newest_count": newest["review_count"],
+        }
+    finally:
+        conn.close()

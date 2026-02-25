@@ -37,6 +37,7 @@ def _build_diagnostic_response(
     lead_id: int,
     merged: Dict[str, Any],
     city: str,
+    state: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build UI-ready diagnostic response from enriched lead."""
     oi = merged.get("objective_intelligence") or {}
@@ -126,10 +127,11 @@ def _build_diagnostic_response(
     if city == "—" and merged.get("formatted_address"):
         city = _extract_city_from_address(merged.get("formatted_address"))
 
-    return {
+    out = {
         "lead_id": lead_id,
         "business_name": business_name,
         "city": str(city),
+        "state": state or None,
         "opportunity_profile": str(opportunity_profile),
         "constraint": str(constraint),
         "primary_leverage": str(primary_leverage),
@@ -138,11 +140,80 @@ def _build_diagnostic_response(
         "paid_status": str(paid_status),
         "intervention_plan": intervention_items,
     }
+    if vm:
+        out["brief"] = vm
+
+    # Service intelligence, revenue breakdowns, conversion, risk flags, evidence
+    service_intel = merged.get("service_intelligence") or {}
+    rev = merged.get("revenue_intelligence") or {}
+    signals = merged
+    oi = merged.get("objective_intelligence") or {}
+    snapshot = merged.get("competitive_snapshot") or {}
+
+    detected_raw = service_intel.get("high_ticket_services_detected") or service_intel.get("high_ticket_procedures_detected") or []
+    detected_services: List[str] = []
+    for x in detected_raw:
+        if isinstance(x, str):
+            detected_services.append(x)
+        elif isinstance(x, dict) and (x.get("procedure") or x.get("service")):
+            detected_services.append(str(x.get("procedure") or x.get("service")))
+
+    service_block = {
+        "detected_services": detected_services,
+        "missing_services": list(service_intel.get("missing_high_value_pages") or []),
+        "schema_detected": signals.get("signal_has_schema_microdata"),
+    }
+
+    revenue_breakdowns: List[Dict[str, Any]] = []
+    for svc in rev.get("service_opportunities", []):
+        if not isinstance(svc, dict):
+            continue
+        revenue_breakdowns.append({
+            "service": str(svc.get("service") or ""),
+            "consults_per_month": str(svc.get("consults_range") or svc.get("consults_per_month") or ""),
+            "revenue_per_case": str(svc.get("revenue_per_case") or ""),
+            "annual_revenue_range": str(svc.get("annual_revenue_range") or ""),
+        })
+
+    conversion_block = {
+        "online_booking": signals.get("signal_has_automated_scheduling"),
+        "contact_form": signals.get("signal_has_contact_form"),
+        "phone_prominent": signals.get("signal_has_phone"),
+        "mobile_optimized": signals.get("signal_mobile_friendly"),
+        "page_load_ms": signals.get("signal_page_load_time_ms"),
+    }
+
+    evidence: List[Dict[str, str]] = []
+    lead_reviews = snapshot.get("lead_review_count")
+    avg_reviews = snapshot.get("avg_review_count")
+    if lead_reviews is not None and avg_reviews is not None:
+        evidence.append({
+            "label": "Reviews vs Market",
+            "value": f"{lead_reviews} vs {avg_reviews}",
+        })
+    if signals.get("signal_has_schema_microdata") is False:
+        evidence.append({
+            "label": "Schema",
+            "value": "Not detected",
+        })
+
+    risk_flags = oi.get("risk_flags") if isinstance(oi.get("risk_flags"), list) else []
+    if not risk_flags and vm and isinstance(vm.get("risk_flags"), list):
+        risk_flags = vm["risk_flags"]
+
+    out["service_intelligence"] = service_block
+    out["revenue_breakdowns"] = revenue_breakdowns
+    out["conversion_infrastructure"] = conversion_block
+    out["risk_flags"] = list(risk_flags)
+    out["evidence"] = evidence
+
+    return out
 
 
 def run_diagnostic(
     business_name: str,
     city: str,
+    state: Optional[str] = None,
     website: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -157,6 +228,10 @@ def run_diagnostic(
     from pipeline.enrich import PlaceDetailsEnricher
     from pipeline.signals import extract_signals, merge_signals_into_lead
     from pipeline.meta_ads import get_meta_access_token, augment_lead_with_meta_ads
+    from pipeline.google_ads_check import augment_lead_with_google_ads
+    from pipeline.seo_traffic import augment_lead_with_seo_traffic
+    from pipeline.ga4_integration import augment_lead_with_ga4
+    from pipeline.google_ads_api import augment_lead_with_google_ads_api
     from pipeline.semantic_signals import build_semantic_signals
     from pipeline.decision_agent import DecisionAgent
     from pipeline.dentist_profile import is_dental_practice, build_dentist_profile_v1, fetch_website_html_for_trust
@@ -183,10 +258,14 @@ def run_diagnostic(
         update_lead_dentist_data,
         update_run_completed,
         update_run_failed,
+        save_review_snapshot,
+        get_review_velocity,
     )
+    from pipeline.embedding_store import store_lead_embedding_if_eligible
 
-    # 1) Resolve place via name + city (most reliable)
-    lead = resolve_from_name_city(business_name.strip(), city.strip())
+    # 1) Resolve place via name + city + state (most reliable)
+    resolved_state = state.strip() if state else None
+    lead = resolve_from_name_city(business_name.strip(), city.strip(), state=resolved_state)
     resolved_city = city.strip()
 
     if not lead or not lead.get("place_id"):
@@ -213,6 +292,34 @@ def run_diagnostic(
     use_meta = get_meta_access_token() is not None
     if use_meta:
         augment_lead_with_meta_ads(merged)
+
+    # Google Ads Transparency Center — authoritative source for Google Ads detection
+    augment_lead_with_google_ads(merged)
+
+    # SEO traffic data from Semrush/Ahrefs when configured
+    augment_lead_with_seo_traffic(merged)
+
+    # GA4 real traffic and conversion data when connected
+    augment_lead_with_ga4(merged)
+
+    # Google Ads API for real spend data when connected
+    augment_lead_with_google_ads_api(merged)
+
+    # Review tracking: save snapshot and compute real velocity from historical data
+    place_id = merged.get("place_id")
+    review_count = merged.get("signal_review_count") or merged.get("user_ratings_total")
+    rating_val = merged.get("signal_rating") or merged.get("rating")
+    if place_id and review_count:
+        try:
+            review_count_int = int(review_count)
+            rating_float = float(rating_val) if rating_val else None
+            save_review_snapshot(place_id, review_count_int, rating_float)
+            real_velocity = get_review_velocity(place_id)
+            if real_velocity is not None:
+                merged["real_review_velocity"] = real_velocity
+                merged["signal_real_review_velocity_30d"] = real_velocity["velocity_per_30d"]
+        except (ValueError, TypeError):
+            pass
 
     agency_type = os.getenv("AGENCY_TYPE", "marketing").lower() or "marketing"
     run_id = create_run({
@@ -339,6 +446,8 @@ def run_diagnostic(
                 sales_intervention_intelligence=sales_intel if sales_intel else None,
                 objective_decision_layer=obj_layer if obj_layer else None,
             )
+            if merged.get("objective_intelligence"):
+                store_lead_embedding_if_eligible(lead_id, merged, force_embed=False)
         else:
             semantic = build_semantic_signals(merged)
             decision = agent.decide(semantic, lead_name=merged.get("name") or "")
@@ -357,7 +466,33 @@ def run_diagnostic(
             )
 
         update_run_completed(run_id, 1, run_stats={"total": 1})
-        return _build_diagnostic_response(lead_id, merged, resolved_city)
+        response = _build_diagnostic_response(lead_id, merged, resolved_city, state=resolved_state)
+
+        # Store predictions for outcome tracking / calibration
+        try:
+            from pipeline.outcome_tracking import save_diagnostic_predictions, ensure_outcome_tables
+            ensure_outcome_tables()
+            rev_intel = merged.get("revenue_intelligence") or {}
+            oi = merged.get("objective_intelligence") or {}
+            svc_intel = merged.get("service_intelligence") or {}
+            predictions = {
+                "revenue_band": rev_intel.get("revenue_band_estimate"),
+                "revenue_upside": rev_intel.get("organic_revenue_gap_estimate"),
+                "constraint": (oi.get("root_bottleneck") or {}).get("bottleneck"),
+                "missing_services": svc_intel.get("missing_high_value_pages", []),
+                "detected_services": svc_intel.get("high_ticket_services_detected", []),
+                "has_booking": merged.get("signal_has_automated_scheduling"),
+                "has_schema": merged.get("signal_has_schema_microdata"),
+                "runs_google_ads": merged.get("signal_runs_paid_ads"),
+                "review_count": merged.get("signal_review_count") or merged.get("user_ratings_total"),
+                "review_velocity_30d": merged.get("signal_review_velocity_30d"),
+                "traffic_estimate": rev_intel.get("traffic_estimate_monthly"),
+            }
+            save_diagnostic_predictions(lead_id, merged.get("place_id", ""), predictions)
+        except Exception as pred_exc:
+            logger.warning("Failed to save diagnostic predictions: %s", pred_exc)
+
+        return response
 
     except Exception:
         update_run_failed(run_id)
