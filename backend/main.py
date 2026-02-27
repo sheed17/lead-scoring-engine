@@ -11,6 +11,9 @@ from backend.routes.diagnostic import router as diagnostic_router
 from backend.routes.jobs import router as jobs_router
 from backend.routes.diagnostics import router as diagnostics_router
 from backend.routes.outcomes import router as outcomes_router
+from backend.routes.territory import router as territory_router
+from backend.routes.public_brief import router as public_brief_router
+from backend.routes.ask import router as ask_router
 from backend.services.job_worker import start_worker, stop_worker
 from pipeline.db import init_db
 
@@ -43,6 +46,9 @@ app.include_router(diagnostic_router)
 app.include_router(jobs_router)
 app.include_router(diagnostics_router)
 app.include_router(outcomes_router)
+app.include_router(territory_router)
+app.include_router(public_brief_router)
+app.include_router(ask_router)
 
 
 @app.get("/health")

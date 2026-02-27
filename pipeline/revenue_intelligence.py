@@ -13,6 +13,20 @@ def _has_high_ticket(high_ticket_procedures: List[Any]) -> bool:
     return bool(high_ticket_procedures and len(high_ticket_procedures) > 0)
 
 
+def _format_missing_services(missing_pages: List[Any], max_items: int = 3) -> str:
+    items: List[str] = []
+    for v in missing_pages or []:
+        if not isinstance(v, str):
+            continue
+        s = v.strip()
+        if not s:
+            continue
+        items.append(s)
+    if not items:
+        return ""
+    return ", ".join(items[:max_items])
+
+
 def build_revenue_intelligence(
     context: Dict[str, Any],
     dentist_profile: Dict[str, Any],
@@ -81,12 +95,27 @@ def build_revenue_intelligence(
     weak_schema = not schema_present
 
     cost_leakage_signals: List[str] = []
-    if paid.get("high_ticket_focus") is True and missing_pages:
-        cost_leakage_signals.append("High-ticket services promoted in ads but no dedicated landing pages")
-    elif high_ticket_detected and missing_pages:
-        cost_leakage_signals.append("High-ticket services offered but no dedicated landing pages")
-    if ads_active and missing_pages:
-        cost_leakage_signals.append("Paid ads running but high-value service pages missing")
+    missing_count = len(missing_pages) if isinstance(missing_pages, list) else 0
+    high_ticket_count = len(high_ticket) if isinstance(high_ticket, list) else 0
+    missing_list_txt = _format_missing_services(missing_pages)
+    all_high_ticket_missing = bool(high_ticket_count > 0 and missing_count >= high_ticket_count)
+    some_high_ticket_missing = bool(missing_count > 0 and not all_high_ticket_missing)
+
+    if paid.get("high_ticket_focus") is True and missing_count > 0:
+        if all_high_ticket_missing:
+            cost_leakage_signals.append("High-ticket services promoted in ads but all high-value service pages are missing")
+        else:
+            suffix = f" ({missing_list_txt})" if missing_list_txt else ""
+            cost_leakage_signals.append(f"High-ticket services promoted in ads but some high-value service pages are missing{suffix}")
+    elif high_ticket_detected and missing_count > 0:
+        if all_high_ticket_missing:
+            cost_leakage_signals.append("High-ticket services offered but no dedicated landing pages")
+        elif some_high_ticket_missing:
+            suffix = f" ({missing_list_txt})" if missing_list_txt else ""
+            cost_leakage_signals.append(f"Some high-value services are missing dedicated pages{suffix}")
+    if ads_active and missing_count > 0:
+        suffix = f" ({missing_list_txt})" if missing_list_txt else ""
+        cost_leakage_signals.append(f"Paid ads running but high-value service pages are missing{suffix}")
     # Use booking_conversion_path when available (dentist-realistic); else fall back to automated_scheduling
     booking_path = context.get("signal_booking_conversion_path")
     has_online_booking = booking_path in ("Online booking (limited)", "Online booking (full)")

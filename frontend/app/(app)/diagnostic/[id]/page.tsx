@@ -3,8 +3,17 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { getDiagnostic, deleteDiagnostic, submitDiagnostic, pollUntilDone } from "@/lib/api";
+import {
+  getDiagnostic,
+  deleteDiagnostic,
+  submitDiagnostic,
+  pollUntilDone,
+  createDiagnosticShareLink,
+  getDiagnosticBriefPdfUrl,
+} from "@/lib/api";
 import type { DiagnosticResponse } from "@/lib/types";
+import Button from "@/app/components/ui/Button";
+import { Card } from "@/app/components/ui/Card";
 
 function oppProfileText(op: unknown): string {
   if (!op) return "";
@@ -15,29 +24,50 @@ function oppProfileText(op: unknown): string {
   return String(op);
 }
 
+function leverageDriversText(op: unknown): string {
+  if (!op || typeof op !== "object") return "";
+  const drivers = (op as {
+    leverage_drivers?: {
+      missing_high_value_pages?: boolean;
+      market_density_high?: boolean;
+      schema_missing?: boolean;
+      paid_active?: boolean;
+      review_deficit?: boolean;
+    };
+  }).leverage_drivers;
+  if (!drivers) return "";
+  return [
+    `missing high-value pages ${drivers.missing_high_value_pages ? "✓" : "✗"}`,
+    `high-density market ${drivers.market_density_high ? "✓" : "✗"}`,
+    `schema missing ${drivers.schema_missing ? "✓" : "✗"}`,
+    `paid ads active ${drivers.paid_active ? "✓" : "✗"}`,
+    `review deficit (<50% of local avg) ${drivers.review_deficit ? "✓" : "✗"}`,
+  ].join(", ");
+}
+
 export default function DiagnosticDetailPage() {
   const params = useParams();
   const router = useRouter();
   const id = Number(params.id);
+  const invalidId = !id || isNaN(id);
 
   const [result, setResult] = useState<DiagnosticResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [evidenceOpen, setEvidenceOpen] = useState(false);
   const [rerunning, setRerunning] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [sharing, setSharing] = useState(false);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!id || isNaN(id)) {
-      setError("Invalid diagnostic ID");
-      setLoading(false);
+    if (invalidId) {
       return;
     }
     getDiagnostic(id)
       .then(setResult)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [id]);
+  }, [id, invalidId]);
 
   async function handleRerun() {
     if (!result) return;
@@ -72,10 +102,36 @@ export default function DiagnosticDetailPage() {
     }
   }
 
+  async function handleShare() {
+    setSharing(true);
+    try {
+      const res = await createDiagnosticShareLink(id);
+      const uiUrl = `${window.location.origin}/brief/s/${res.token}`;
+      setShareUrl(uiUrl);
+      await navigator.clipboard.writeText(uiUrl);
+      alert("Share link copied to clipboard");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create share link");
+    } finally {
+      setSharing(false);
+    }
+  }
+
+  if (invalidId) {
+    return (
+      <div className="mx-auto max-w-5xl px-2 py-10">
+        <main className="text-center">
+          <p className="text-red-600">Invalid diagnostic ID</p>
+          <Link href="/dashboard" className="mt-4 inline-block text-sm text-zinc-600 underline">Back to dashboard</Link>
+        </main>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
-      <div className="min-h-[calc(100vh-8rem)] bg-zinc-50">
-        <main className="mx-auto max-w-3xl px-6 py-20 text-center">
+      <div className="mx-auto max-w-5xl px-2 py-10">
+        <main className="text-center">
           <div className="inline-block h-6 w-6 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-600" />
           <p className="mt-3 text-sm text-zinc-400">Loading diagnostic…</p>
         </main>
@@ -85,8 +141,8 @@ export default function DiagnosticDetailPage() {
 
   if (error || !result) {
     return (
-      <div className="min-h-[calc(100vh-8rem)] bg-zinc-50">
-        <main className="mx-auto max-w-3xl px-6 py-20 text-center">
+      <div className="mx-auto max-w-5xl px-2 py-10">
+        <main className="text-center">
           <p className="text-red-600">{error || "Diagnostic not found"}</p>
           <Link href="/dashboard" className="mt-4 inline-block text-sm text-zinc-600 underline">Back to dashboard</Link>
         </main>
@@ -104,42 +160,77 @@ export default function DiagnosticDetailPage() {
   const ht = b?.high_ticket_gaps;
   const rucg = b?.revenue_upside_capture_gap;
   const ci = b?.conversion_infrastructure;
+  const cd = b?.competitive_delta as Record<string, unknown> | undefined;
+  const serp = b?.serp_presence as Record<string, unknown> | undefined;
+  const reviewIntel = b?.review_intelligence as Record<string, unknown> | undefined;
+  const convStruct = b?.conversion_structure as Record<string, unknown> | undefined;
+  const marketSat = b?.market_saturation as Record<string, unknown> | undefined;
+  const geo = b?.geo_coverage as Record<string, unknown> | undefined;
+  const reviewSampleSize = Number(reviewIntel?.review_sample_size || 0);
+  const reviewServiceMentions = (reviewIntel?.service_mentions as Record<string, unknown>) || {};
+  const reviewComplaintThemes = (reviewIntel?.complaint_themes as Record<string, unknown>) || {};
 
   return (
-    <div className="min-h-[calc(100vh-8rem)] bg-zinc-50 text-zinc-900">
-      <main className="mx-auto max-w-3xl px-6 py-10">
+    <div className="mx-auto max-w-6xl text-[var(--text-primary)]">
+      <main>
         {/* Top bar */}
-        <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <Link href="/dashboard" className="text-sm text-zinc-500 hover:text-zinc-700">&larr; Dashboard</Link>
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-sm text-[var(--text-muted)]">
+            <Link href="/dashboard" className="app-link">Dashboard</Link> {"→"} <span className="text-[var(--text-secondary)]">{result.business_name}</span>
+          </p>
           <div className="flex items-center gap-2">
-            <button
+            <Button
+              onClick={handleShare}
+              disabled={sharing}
+            >
+              {sharing ? "Sharing…" : "Share"}
+            </Button>
+            <a
+              href={getDiagnosticBriefPdfUrl(id)}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex h-9 items-center rounded-[var(--radius-md)] border border-[var(--border-default)] bg-[var(--bg-card)] px-3 text-sm font-medium text-[var(--text-secondary)] hover:bg-slate-50"
+            >
+              Download PDF
+            </a>
+            <Button
               onClick={handleRerun}
               disabled={rerunning}
-              className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50 disabled:opacity-50"
             >
               {rerunning ? "Re-running…" : "Re-run diagnostic"}
-            </button>
-            <button
+            </Button>
+            <Button
               onClick={handleDelete}
               disabled={deleting}
-              className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-600 transition hover:bg-red-50 disabled:opacity-50"
+              className="border-rose-200 text-rose-600 hover:bg-rose-50"
             >
               Delete
-            </button>
+            </Button>
           </div>
         </div>
 
-        <section className="rounded-xl border border-zinc-200 bg-white p-6 shadow-sm">
+        <Card className="p-6">
           <h2 className="mb-1 text-sm font-medium uppercase tracking-wider text-zinc-500">Revenue Intelligence Brief</h2>
           <p className="mb-5 text-sm text-zinc-700">Lead #{result.lead_id} · {result.business_name} · {result.city}{result.state ? `, ${result.state}` : ""}</p>
 
           <div className="space-y-6 text-sm">
+            {shareUrl && (
+              <BriefSection title="Share Link">
+                <p className="break-all text-zinc-700">{shareUrl}</p>
+              </BriefSection>
+            )}
+
             {/* 1. Executive Diagnosis */}
             <BriefSection title="Executive Diagnosis">
               <KV label="Constraint" value={ed?.constraint ?? result.constraint} />
               <KV label="Primary Leverage" value={ed?.primary_leverage ?? (result.primary_leverage !== "—" ? result.primary_leverage : undefined)} />
               {(ed?.opportunity_profile || result.opportunity_profile) && (
                 <p><strong>Opportunity Profile:</strong> {oppProfileText(ed?.opportunity_profile) || result.opportunity_profile}</p>
+              )}
+              {leverageDriversText(ed?.opportunity_profile) && (
+                <p className="text-xs text-zinc-500">
+                  Based on: {leverageDriversText(ed?.opportunity_profile)}.
+                </p>
               )}
               <KV label="Modeled Revenue Upside" value={ed?.modeled_revenue_upside} />
               {b?.executive_footnote && <p className="mt-2 text-xs text-zinc-500">{b.executive_footnote}</p>}
@@ -149,6 +240,7 @@ export default function DiagnosticDetailPage() {
             {(mp?.revenue_band || mp?.reviews || mp?.local_avg || mp?.market_density || result.review_position || result.market_density) ? (
               <BriefSection title="Market Position">
                 <KV label="Revenue Band" value={mp?.revenue_band} />
+                {mp?.revenue_band_method && <p className="text-xs text-zinc-500">{mp.revenue_band_method}</p>}
                 <KV label="Reviews" value={mp?.reviews} />
                 <KV label="Local Avg" value={mp?.local_avg} />
                 <KV label="Market Density" value={mp?.market_density ?? result.market_density} />
@@ -178,18 +270,110 @@ export default function DiagnosticDetailPage() {
               </BriefSection>
             ) : null}
 
+            {cd ? (
+              <BriefSection title="Competitive Delta">
+                <KV
+                  label="Service pages"
+                  value={
+                    cd.competitor_avg_service_pages != null
+                      ? `${cd.target_service_page_count ?? 0} pages with service-like paths (for example, /implants, /cosmetic) vs competitor avg ${Number(cd.competitor_avg_service_pages).toFixed(1)}`
+                      : `Target: ${cd.target_service_page_count ?? 0} pages with service-like paths (${String(cd.competitor_crawl_note || "Competitor website metrics not run for this brief.")})`
+                  }
+                />
+                {cd.target_pages_with_faq_schema != null && (
+                  <KV
+                    label="FAQ/Schema coverage"
+                    value={
+                      cd.competitor_avg_pages_with_schema != null
+                        ? `${cd.target_pages_with_faq_schema} of ${cd.target_service_page_count ?? 0} service pages vs competitor avg ${Number(cd.competitor_avg_pages_with_schema).toFixed(1)} pages`
+                        : `${cd.target_pages_with_faq_schema} of ${cd.target_service_page_count ?? 0} service pages`
+                    }
+                  />
+                )}
+                <KV
+                  label="Service page depth"
+                  value={
+                    cd.competitor_avg_word_count != null
+                      ? `Average word count across ${cd.target_service_page_count ?? 0} service pages: ~${Math.round(Number(cd.target_avg_word_count_service_pages ?? 0))} (min ${cd.target_min_word_count_service_pages ?? "N/A"}, max ${cd.target_max_word_count_service_pages ?? "N/A"}) vs competitor avg ~${Math.round(Number(cd.competitor_avg_word_count))}`
+                      : cd.target_avg_word_count_service_pages != null
+                        ? `Average word count across ${cd.target_service_page_count ?? 0} service pages: ~${Math.round(Number(cd.target_avg_word_count_service_pages))} (min ${cd.target_min_word_count_service_pages ?? "N/A"}, max ${cd.target_max_word_count_service_pages ?? "N/A"})`
+                        : undefined
+                  }
+                />
+                <p className="text-xs text-zinc-500">
+                  {cd.competitors_sampled ? `Based on ${cd.competitors_sampled} nearby competitors.` : "Target-only snapshot for this run."}
+                </p>
+                {cd.competitor_site_metrics_count != null && Number(cd.competitor_site_metrics_count) > 0 && (
+                  <p className="text-xs text-zinc-500">
+                    Competitor averages from {String(cd.competitor_site_metrics_count)} competitor sites crawled.
+                  </p>
+                )}
+              </BriefSection>
+            ) : null}
+
             {/* 5. Demand Signals */}
-            {(ds?.google_ads_line != null || ds?.meta_ads_line != null || ds?.paid_spend_estimate || ds?.organic_visibility_tier || ds?.last_review_days_ago != null || ds?.review_velocity_30d != null) || (!ds && result.paid_status) ? (
+            {(ds?.google_ads_line != null || ds?.meta_ads_line != null || ds?.organic_visibility_tier || ds?.last_review_days_ago != null || ds?.review_velocity_30d != null) || (!ds && result.paid_status) ? (
               <BriefSection title="Demand Signals">
                 <KV label="Google Ads" value={ds?.google_ads_line} />
-                {ds?.paid_spend_estimate && <KV label="Paid Spend Estimate" value={ds.paid_spend_estimate} />}
+                {ds?.google_ads_source && <p className="text-xs text-zinc-500">Source: {ds.google_ads_source}</p>}
                 <KV label="Meta Ads" value={ds?.meta_ads_line} />
+                {ds?.meta_ads_source && <p className="text-xs text-zinc-500">Source: {ds.meta_ads_source}</p>}
+                {ds?.paid_channels_detected?.length ? <KV label="Paid channels detected" value={ds.paid_channels_detected.join(", ")} /> : null}
                 {ds?.organic_visibility_tier && (
                   <KV label="Organic Visibility" value={`${ds.organic_visibility_tier}${ds.organic_visibility_reason ? ` — ${ds.organic_visibility_reason}` : ''}`} />
                 )}
                 {ds?.last_review_days_ago != null && <KV label="Last Review" value={`~${ds.last_review_days_ago} days ago${ds.last_review_estimated ? ' (estimated)' : ''}`} />}
                 {ds?.review_velocity_30d != null && <KV label="Review Velocity" value={`~${ds.review_velocity_30d} in last 30 days${ds.review_velocity_estimated ? ' (estimated)' : ''}`} />}
                 {!ds && result.paid_status && <KV label="Paid Status" value={result.paid_status} />}
+              </BriefSection>
+            ) : null}
+
+            {serp && Array.isArray(serp.keywords) ? (
+              <BriefSection title="SERP Presence">
+                <ul className="list-inside list-disc space-y-1">
+                  {(serp.keywords as Array<Record<string, unknown>>).slice(0, 6).map((k, i) => (
+                    <li key={i}>
+                      {String(k.keyword || "keyword")}:
+                      {" "}
+                      {k.position == null ? "not in top 10" : `position ${k.position}`}
+                    </li>
+                  ))}
+                </ul>
+                {serp.as_of_date && <p className="text-xs text-zinc-500">As of {String(serp.as_of_date)}</p>}
+              </BriefSection>
+            ) : null}
+
+            {reviewIntel ? (
+              <BriefSection title="Review Intelligence">
+                {reviewSampleSize > 0 && (
+                  <p>
+                    <strong>Directional signal from {reviewSampleSize} sampled Google reviews:</strong>{" "}
+                    {String(reviewIntel.summary || "No strong qualitative pattern extracted.")}
+                  </p>
+                )}
+                {Object.keys(reviewServiceMentions).length > 0 && (
+                  <p>
+                    <strong>Most-mentioned services in sample:</strong>{" "}
+                    {Object.entries(reviewServiceMentions)
+                      .slice(0, 6)
+                      .map(([k, v]) => `${k}: ${v}/${reviewSampleSize || "N"}`)
+                      .join(", ")}
+                  </p>
+                )}
+                {Object.keys(reviewComplaintThemes).length > 0 && (
+                  <p>
+                    <strong>Negative/friction mentions in sample:</strong>{" "}
+                    {Object.entries(reviewComplaintThemes)
+                      .slice(0, 4)
+                      .map(([k, v]) => `${k}: ${v}/${reviewSampleSize || "N"}`)
+                      .join(", ")}
+                  </p>
+                )}
+                {reviewSampleSize > 0 && (
+                  <p className="text-xs text-zinc-500">
+                    Source: Google Place Details ({reviewSampleSize} reviews max). Use this as directional voice-of-customer input, not a full review corpus.
+                  </p>
+                )}
               </BriefSection>
             ) : null}
 
@@ -254,16 +438,15 @@ export default function DiagnosticDetailPage() {
                 <p>{rucg.consult_low}–{rucg.consult_high} additional consults/month</p>
                 <p>${(rucg.case_low ?? 0).toLocaleString()}–${(rucg.case_high ?? 0).toLocaleString()} per case</p>
                 <p className="font-medium">${(rucg.annual_low ?? 0).toLocaleString()}–${(rucg.annual_high ?? 0).toLocaleString()} annually</p>
-                <p className="mt-1 text-xs text-zinc-500">Modeled from public proxy signals; not GA4 or Ads platform data.</p>
+                {rucg.method_note && <p className="text-xs text-zinc-500">{rucg.method_note}</p>}
+                {rucg.gap_service && <KV label="Competitive gap service" value={rucg.gap_service} />}
               </BriefSection>
             ) : null}
 
             {/* 8. Strategic Gap Identified */}
             {sg && sg.competitor_name ? (
               <BriefSection title="Strategic Gap Identified">
-                <p>Nearest competitor {sg.competitor_name} holds {sg.competitor_reviews ?? "—"} reviews within {sg.distance_miles ?? "—"} miles.</p>
-                <p>This practice offers high-ticket services but lacks dedicated service pages and/or schema support.</p>
-                <p>Capture gap identified in a high-margin service category within a {sg.market_density ?? "High"} density market.</p>
+                <p>Nearest competitor {sg.competitor_name} holds {sg.competitor_reviews ?? "—"} reviews within {sg.distance_miles ?? "—"} miles in a {sg.market_density ?? "High"} density market.</p>
               </BriefSection>
             ) : null}
 
@@ -280,6 +463,33 @@ export default function DiagnosticDetailPage() {
                 </BriefSection>
               );
             })() : null}
+
+            {convStruct ? (
+              <BriefSection title="Conversion Structure">
+                {convStruct.phone_clickable != null && <KV label="Phone clickable" value={convStruct.phone_clickable ? "Yes" : "No"} />}
+                {convStruct.cta_count != null && <KV label="CTA count" value={String(convStruct.cta_count)} />}
+                {convStruct.form_single_or_multi_step != null && <KV label="Form structure" value={String(convStruct.form_single_or_multi_step)} />}
+              </BriefSection>
+            ) : null}
+
+            {marketSat ? (
+              <BriefSection title="Market Saturation">
+                {marketSat.top_5_avg_reviews != null && <KV label="Top 5 avg reviews" value={String(marketSat.top_5_avg_reviews)} />}
+                {marketSat.competitor_median_reviews != null && marketSat.target_gap_from_median != null && (
+                  <KV label="Median comparison" value={`Median ${marketSat.competitor_median_reviews}; target is ${marketSat.target_gap_from_median}`} />
+                )}
+              </BriefSection>
+            ) : null}
+
+            {geo ? (
+              <BriefSection title="Geographic Coverage">
+                {geo.city_or_near_me_page_count != null && <KV label="City/near-me pages" value={`${geo.city_or_near_me_page_count} detected`} />}
+                {geo.city_or_near_me_page_count != null && (
+                  <p className="text-xs text-zinc-500">(URLs with city name or &apos;near me&apos; in path/title).</p>
+                )}
+                {geo.has_multi_location_page != null && <KV label="Multi-location page" value={geo.has_multi_location_page ? "Detected" : "Not detected"} />}
+              </BriefSection>
+            ) : null}
 
             {/* 10. Risk Flags */}
             {(b?.risk_flags?.length || result.risk_flags?.length) ? (
@@ -307,28 +517,18 @@ export default function DiagnosticDetailPage() {
               </BriefSection>
             ) : null}
 
-            {/* 12. Evidence (collapsible) */}
+            {/* 12. Evidence */}
             {(b?.evidence_bullets?.length || result.evidence?.length) ? (
-              <div className="border-t border-zinc-100 pt-4">
-                <button
-                  type="button"
-                  className="flex items-center gap-1 font-medium text-zinc-800 hover:text-zinc-600"
-                  onClick={() => setEvidenceOpen(!evidenceOpen)}
-                >
-                  <span className="text-xs">{evidenceOpen ? "▼" : "▶"}</span>
-                  Evidence (click to expand)
-                </button>
-                {evidenceOpen && (
-                  <ul className="mt-2 list-inside list-disc space-y-1 text-zinc-700">
-                    {b?.evidence_bullets?.length
-                      ? b.evidence_bullets.map((e, i) => <li key={i}>{e}</li>)
-                      : (result.evidence ?? []).map((e, i) => <li key={i}><strong>{e.label}:</strong> {e.value}</li>)}
-                  </ul>
-                )}
-              </div>
+              <BriefSection title="Evidence">
+                <ul className="list-inside list-disc space-y-1 text-zinc-700">
+                  {b?.evidence_bullets?.length
+                    ? b.evidence_bullets.map((e, i) => <li key={i}>{e}</li>)
+                    : (result.evidence ?? []).map((e, i) => <li key={i}><strong>{e.label}:</strong> {e.value}</li>)}
+                </ul>
+              </BriefSection>
             ) : null}
           </div>
-        </section>
+        </Card>
       </main>
     </div>
   );
@@ -336,9 +536,9 @@ export default function DiagnosticDetailPage() {
 
 function BriefSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="border-t border-zinc-100 pt-4 first:border-t-0 first:pt-0">
-      <h3 className="mb-2 font-medium text-zinc-800">{title}</h3>
-      <div className="space-y-1.5 text-zinc-700">{children}</div>
+    <div className="rounded-[var(--radius-md)] border border-[var(--border-default)] bg-[var(--bg-card)] px-4 py-3">
+      <h3 className="mb-2 text-sm font-semibold text-[var(--text-primary)]">{title}</h3>
+      <div className="space-y-1.5 text-[var(--text-secondary)]">{children}</div>
     </div>
   );
 }

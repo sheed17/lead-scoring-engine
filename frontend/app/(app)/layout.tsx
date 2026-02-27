@@ -1,17 +1,12 @@
 "use client";
 
 import { AuthGuard } from "@/lib/auth";
-import Nav from "../components/Nav";
-import Footer from "../components/Footer";
+import AppShell from "../components/AppShell";
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
     <AuthGuard>
-      <div className="flex min-h-screen flex-col">
-        <Nav />
-        <div className="flex-1">{children}</div>
-        <Footer />
-      </div>
+      <AppShell>{children}</AppShell>
     </AuthGuard>
   );
 }

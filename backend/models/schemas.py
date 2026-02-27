@@ -89,6 +89,7 @@ class JobStatusResponse(BaseModel):
     completed_at: Optional[str] = None
     error: Optional[str] = None
     diagnostic_id: Optional[int] = None
+    progress: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------

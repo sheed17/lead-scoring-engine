@@ -33,6 +33,160 @@ def _extract_city_from_address(formatted_address: Optional[str]) -> str:
     return parts[0] if parts else "—"
 
 
+def _parse_root_constraint_label(raw: str) -> str:
+    val = (raw or "").strip().lower()
+    if any(k in val for k in ("visibility", "capture", "position")):
+        return "visibility"
+    if any(k in val for k in ("conversion", "cro")):
+        return "conversion"
+    if any(k in val for k in ("trust", "authority", "reputation")):
+        return "trust"
+    if val:
+        return "mixed"
+    return "unknown"
+
+
+def _derive_demand_level(merged: Dict[str, Any]) -> str:
+    dcm = (merged.get("objective_decision_layer") or {}).get("demand_capture_conversion_model") or {}
+    demand = str((dcm.get("demand_signals") or {}).get("status") or "").strip().lower()
+    if demand == "strong":
+        return "high"
+    if demand == "moderate":
+        return "medium"
+    if demand == "weak":
+        return "low"
+    return "unknown"
+
+
+def _to_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_deterministic_intervention_plan(
+    merged: Dict[str, Any],
+    constraint_label: str,
+) -> Dict[str, Any]:
+    signals = merged
+    svc = merged.get("service_intelligence") or {}
+    comp = merged.get("competitive_snapshot") or {}
+    lead_reviews = _to_float(signals.get("signal_review_count") or signals.get("user_ratings_total")) or 0.0
+    avg_reviews = _to_float(comp.get("avg_review_count")) or 0.0
+    review_gap_pct = ((avg_reviews - lead_reviews) / avg_reviews) if avg_reviews > 0 else 0.0
+
+    has_website = bool(signals.get("signal_has_website") or signals.get("signal_website_url"))
+    has_ssl = bool(signals.get("signal_has_ssl"))
+    has_form = bool(signals.get("signal_has_contact_form"))
+    has_phone = bool(signals.get("signal_has_phone"))
+    has_schema = bool(signals.get("signal_has_schema_microdata"))
+    missing_pages = svc.get("missing_high_value_pages") if isinstance(svc.get("missing_high_value_pages"), list) else []
+    demand_level = _derive_demand_level(merged)
+    root = _parse_root_constraint_label(constraint_label)
+
+    actions: Dict[str, Dict[str, Any]] = {
+        "A1": {
+            "action_id": "A1",
+            "title": "Fix conversion path on core pages",
+            "category": "Conversion",
+            "action": "Ensure phone + contact form are prominent above the fold on homepage and core service pages.",
+            "why_this_now": "Demand is leaking due to weak conversion capture basics.",
+            "expected_window_days": 14,
+            "evidence_refs": ["signal_has_contact_form", "signal_has_phone"],
+        },
+        "A2": {
+            "action_id": "A2",
+            "title": "Establish technical trust baseline",
+            "category": "Trust",
+            "action": "Add/repair SSL and LocalBusiness + Service schema and align contact details site-wide.",
+            "why_this_now": "Trust and crawlability gaps reduce local conversion and visibility.",
+            "expected_window_days": 21,
+            "evidence_refs": ["signal_has_ssl", "signal_has_schema_microdata"],
+        },
+        "A3": {
+            "action_id": "A3",
+            "title": "Run a review velocity system",
+            "category": "Reputation",
+            "action": "Implement a post-visit review request + response cadence with weekly tracking.",
+            "why_this_now": "Review authority trails local market benchmarks.",
+            "expected_window_days": 30,
+            "evidence_refs": ["competitive_snapshot.avg_review_count", "signal_review_count"],
+        },
+        "A4": {
+            "action_id": "A4",
+            "title": "Strengthen local visibility foundations",
+            "category": "SEO",
+            "action": "Optimize GBP categories/services/photos/posts cadence and align core local landing pages.",
+            "why_this_now": "Visibility constraints require stronger local discovery signals.",
+            "expected_window_days": 30,
+            "evidence_refs": ["objective_decision_layer.root_bottleneck_classification"],
+        },
+        "A5": {
+            "action_id": "A5",
+            "title": "Close high-intent service page gaps",
+            "category": "SEO",
+            "action": "Create dedicated landing pages for highest-value missing services with local intent copy.",
+            "why_this_now": "Service-level capture is constrained by missing high-intent pages.",
+            "expected_window_days": 45,
+            "evidence_refs": ["service_intelligence.missing_high_value_pages"],
+        },
+        "A6": {
+            "action_id": "A6",
+            "title": "Launch focused paid capture test",
+            "category": "Demand",
+            "action": "Run a limited high-intent branded/service paid test after conversion baseline is fixed.",
+            "why_this_now": "Demand can be accelerated once capture infrastructure is stable.",
+            "expected_window_days": 21,
+            "evidence_refs": ["objective_decision_layer.demand_capture_conversion_model"],
+        },
+    }
+
+    selected: List[str] = []
+    if not has_website:
+        selected.extend(["A1", "A2", "A4"])
+    if (not has_ssl) or (not has_schema):
+        selected.append("A2")
+    if (not has_form) or (not has_phone):
+        selected.append("A1")
+    if review_gap_pct >= 0.25:
+        selected.append("A3")
+
+    if root == "visibility":
+        selected.extend(["A4", "A3", "A2"])
+    elif root == "conversion":
+        selected.extend(["A1", "A2", "A4"])
+    elif root == "trust":
+        selected.extend(["A2", "A3", "A1"])
+    else:
+        selected.extend(["A4", "A1", "A2"])
+
+    if missing_pages:
+        selected.append("A5")
+    if demand_level == "high" and has_form and has_phone:
+        selected.append("A6")
+
+    ordered: List[str] = []
+    for a in selected:
+        if a not in ordered:
+            ordered.append(a)
+    ordered = ordered[:5] if len(ordered) >= 3 else (ordered + ["A4", "A1", "A2"])[:3]
+
+    plan_structured = []
+    for idx, aid in enumerate(ordered, start=1):
+        item = dict(actions[aid])
+        item["step"] = idx
+        plan_structured.append(item)
+
+    plan_text = [
+        f"{item['title']}: {item['action']} Why now: {item['why_this_now']}."
+        for item in plan_structured
+    ]
+    return {"structured": plan_structured, "text": plan_text}
+
+
 def _build_diagnostic_response(
     lead_id: int,
     merged: Dict[str, Any],
@@ -94,34 +248,17 @@ def _build_diagnostic_response(
         review_position = "—"
     paid_status = (paid or {}).get("status") or "Inactive"
 
-    # Intervention plan
-    plan_oi = (oi.get("intervention_plan") or [])
-    plan_obj = (merged.get("objective_decision_layer") or {}).get("intervention_plan") or []
-    plan = plan_oi if plan_oi else plan_obj
-    sales_intel = merged.get("sales_intervention_intelligence") or {}
-    plan_sales = sales_intel.get("intervention_plan") or []
-    if plan_sales and not plan:
-        plan = plan_sales
-
+    # Deterministic intervention matrix (brief v2 consistency)
+    det_plan = _build_deterministic_intervention_plan(merged, str(constraint))
     intervention_items: List[Dict[str, Any]] = []
-    for i, item in enumerate((plan if isinstance(plan, list) else [])[:6]):
-        if not isinstance(item, dict):
-            continue
-        step = item.get("priority") or item.get("step") or (i + 1)
-        cat = str(item.get("category") or "SEO").strip()
-        action = str(item.get("action") or "").strip()
-        if action:
-            intervention_items.append({"step": int(step), "category": cat, "action": action})
-
-    # Fallback from vm
-    if not intervention_items and vm.get("intervention_plan"):
-        for i, s in enumerate(vm["intervention_plan"][:6]):
-            if isinstance(s, dict) and s.get("action"):
-                intervention_items.append({
-                    "step": i + 1,
-                    "category": str(s.get("category") or "SEO"),
-                    "action": str(s.get("action", "")),
-                })
+    for item in det_plan.get("structured", []):
+        intervention_items.append(
+            {
+                "step": int(item.get("step") or len(intervention_items) + 1),
+                "category": str(item.get("category") or "SEO"),
+                "action": str(item.get("action") or ""),
+            }
+        )
 
     business_name = merged.get("name") or "—"
     if city == "—" and merged.get("formatted_address"):
@@ -129,6 +266,7 @@ def _build_diagnostic_response(
 
     out = {
         "lead_id": lead_id,
+        "place_id": merged.get("place_id"),
         "business_name": business_name,
         "city": str(city),
         "state": state or None,
@@ -141,6 +279,11 @@ def _build_diagnostic_response(
         "intervention_plan": intervention_items,
     }
     if vm:
+        # Keep renderer/LLM intervention plan when present; use deterministic plan only as fallback.
+        if not vm.get("intervention_plan"):
+            vm["intervention_plan"] = det_plan.get("text", [])
+        if not vm.get("intervention_plan_structured"):
+            vm["intervention_plan_structured"] = det_plan.get("structured", [])
         out["brief"] = vm
 
     # Service intelligence, revenue breakdowns, conversion, risk flags, evidence
@@ -206,6 +349,11 @@ def _build_diagnostic_response(
     out["conversion_infrastructure"] = conversion_block
     out["risk_flags"] = list(risk_flags)
     out["evidence"] = evidence
+    out["competitive_delta"] = merged.get("competitive_delta")
+    out["serp_presence"] = merged.get("serp_presence")
+    out["review_intelligence"] = merged.get("review_intelligence") or merged.get("signal_review_intelligence")
+    out["geo_coverage"] = merged.get("geo_coverage")
+    out["authority_proxy"] = merged.get("authority_proxy")
 
     return out
 
@@ -237,6 +385,9 @@ def run_diagnostic(
     from pipeline.dentist_profile import is_dental_practice, build_dentist_profile_v1, fetch_website_html_for_trust
     from pipeline.service_depth import build_service_intelligence, get_page_texts_for_llm
     from pipeline.competitor_sampling import fetch_competitors_nearby, build_competitive_snapshot
+    from pipeline.competitive_delta import build_competitive_delta
+    from pipeline.serp_presence import build_serp_presence
+    from pipeline.authority_proxy import build_authority_proxy
     from pipeline.objective_decision_layer import compute_objective_decision_layer
     from pipeline.objective_intelligence import (
         build_objective_intelligence,
@@ -288,6 +439,8 @@ def run_diagnostic(
     # 3) Extract signals
     signals = extract_signals(enriched)
     merged = merge_signals_into_lead(enriched, signals)
+    if isinstance(merged.get("signal_review_intelligence"), dict):
+        merged["review_intelligence"] = merged.get("signal_review_intelligence")
 
     use_meta = get_meta_access_token() is not None
     if use_meta:
@@ -342,15 +495,41 @@ def run_diagnostic(
             if dentist_profile_v1:
                 merged["dentist_profile_v1"] = dentist_profile_v1
                 procedure_mentions = (dentist_profile_v1.get("review_intent_analysis") or {}).get("procedure_mentions") or []
-                service_intel = build_service_intelligence(url, website_html, procedure_mentions)
+                service_intel = build_service_intelligence(
+                    url,
+                    website_html,
+                    procedure_mentions,
+                    city=resolved_city,
+                    state=resolved_state,
+                )
                 competitors = []
                 search_radius_used_miles = 2
                 lat, lng = merged.get("latitude"), merged.get("longitude")
                 if lat is not None and lng is not None:
                     competitors, search_radius_used_miles = fetch_competitors_nearby(lat, lng, merged.get("place_id"))
                 competitive_snap = build_competitive_snapshot(merged, competitors, search_radius_used_miles) if competitors else {}
+                competitive_delta = build_competitive_delta(merged, service_intel, competitors)
+                serp_presence = build_serp_presence(
+                    city=resolved_city,
+                    state=resolved_state,
+                    website_url=merged.get("signal_website_url"),
+                )
+                authority_proxy = build_authority_proxy(
+                    service_intelligence=service_intel,
+                    serp_presence=serp_presence,
+                    domain_age_years=merged.get("domain_age_years"),
+                )
                 merged["competitive_snapshot"] = competitive_snap
                 merged["service_intelligence"] = service_intel
+                merged["competitive_delta"] = competitive_delta
+                if serp_presence:
+                    merged["serp_presence"] = serp_presence
+                merged["authority_proxy"] = authority_proxy
+                merged["geo_coverage"] = {
+                    "city_or_near_me_page_count": service_intel.get("city_or_near_me_page_count"),
+                    "has_multi_location_page": service_intel.get("has_multi_location_page"),
+                    "geo_page_examples": service_intel.get("geo_page_examples") or [],
+                }
                 obj_layer = compute_objective_decision_layer(
                     merged,
                     service_intelligence=service_intel,

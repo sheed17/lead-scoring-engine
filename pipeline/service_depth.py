@@ -192,6 +192,46 @@ def _extract_headings(html: str) -> str:
     return " ".join(parts).lower()
 
 
+def _has_faq_or_schema(html: str) -> bool:
+    lower = (html or "").lower()
+    return (
+        "application/ld+json" in lower
+        or "faqpage" in lower
+        or "itemscope" in lower
+        or "itemtype" in lower
+    )
+
+
+def _word_count(text: str) -> int:
+    if not text:
+        return 0
+    return len(re.findall(r"[a-zA-Z0-9']+", text))
+
+
+def _city_tokens(city: Optional[str], state: Optional[str]) -> Set[str]:
+    toks: Set[str] = set()
+    for raw in (city or "", state or ""):
+        for t in re.findall(r"[a-z0-9]+", raw.lower()):
+            if len(t) >= 3:
+                toks.add(t)
+    return toks
+
+
+def _is_geo_or_location_page(url: str, headings: str, city_tokens: Set[str]) -> bool:
+    path = (urlparse(url).path or "").lower()
+    path_tokens = set(re.findall(r"[a-z0-9]+", path))
+    geo_markers = {"near", "me", "location", "locations", "area", "areas", "serve", "serving", "neighborhood"}
+    if path_tokens.intersection(geo_markers):
+        return True
+    if any(marker in headings for marker in ("near me", "locations", "areas we serve", "service area", "neighborhood")):
+        return True
+    if city_tokens and path_tokens.intersection(city_tokens):
+        return True
+    if city_tokens and any(tok in headings for tok in city_tokens):
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Sitemap parsing
 # ---------------------------------------------------------------------------
@@ -307,6 +347,8 @@ def build_service_intelligence(
     website_url: Optional[str],
     website_html: Optional[str] = None,
     procedure_mentions_from_reviews: Optional[List[str]] = None,
+    city: Optional[str] = None,
+    state: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build service_intelligence block with canonical bucket resolution.
@@ -321,6 +363,15 @@ def build_service_intelligence(
         "missing_high_value_pages": [],
         "procedure_confidence": 0.0,
         "pages_crawled": 0,
+        "service_page_count": 0,
+        "service_pages_with_faq_or_schema": 0,
+        "avg_word_count_service_pages": 0,
+        "min_word_count_service_pages": 0,
+        "max_word_count_service_pages": 0,
+        "city_or_near_me_page_count": 0,
+        "has_multi_location_page": False,
+        "geo_page_examples": [],
+        "blog_page_count": 0,
     }
     if not (website_url or "").strip():
         return out
@@ -350,12 +401,23 @@ def build_service_intelligence(
             service_urls_deduped.append(u)
 
     # -- Phase 3: Crawl pages (homepage + up to 20 service pages) -------
-    PageInfo = Tuple[str, str, str, Set[str]]  # url, text, headings, path_slugs
+    PageInfo = Tuple[str, str, str, Set[str], bool, int, bool]  # url, text, headings, path_slugs, has_faq_schema, word_count, is_geo
     pages: List[PageInfo] = []
+    geo_tokens = _city_tokens(city, state)
 
     homepage_text = _strip_html(html)
     homepage_headings = _extract_headings(html)
-    pages.append((base_url, homepage_text, homepage_headings, _path_slugs(base_url)))
+    pages.append(
+        (
+            base_url,
+            homepage_text,
+            homepage_headings,
+            _path_slugs(base_url),
+            _has_faq_or_schema(html),
+            _word_count(homepage_text),
+            _is_geo_or_location_page(base_url, homepage_headings, geo_tokens),
+        )
+    )
 
     level1_fetched: Set[str] = {base_url}
     level2_candidates: List[str] = []
@@ -369,7 +431,17 @@ def build_service_intelligence(
         level1_fetched.add(url)
         page_text = _strip_html(h)
         headings = _extract_headings(h)
-        pages.append((url, page_text, headings, _path_slugs(url)))
+        pages.append(
+            (
+                url,
+                page_text,
+                headings,
+                _path_slugs(url),
+                _has_faq_or_schema(h),
+                _word_count(page_text),
+                _is_geo_or_location_page(url, headings, geo_tokens),
+            )
+        )
 
         # Two-level crawl: extract links from this sub-page
         sub_links = _extract_links(h, url)
@@ -390,7 +462,19 @@ def build_service_intelligence(
         h = _fetch_html(url)
         if not h:
             continue
-        pages.append((url, _strip_html(h), _extract_headings(h), _path_slugs(url)))
+        page_text = _strip_html(h)
+        headings = _extract_headings(h)
+        pages.append(
+            (
+                url,
+                page_text,
+                headings,
+                _path_slugs(url),
+                _has_faq_or_schema(h),
+                _word_count(page_text),
+                _is_geo_or_location_page(url, headings, geo_tokens),
+            )
+        )
 
     out["pages_crawled"] = len(pages)
 
@@ -399,7 +483,11 @@ def build_service_intelligence(
     all_mentioned_buckets: Set[str] = set()
     all_general: Set[str] = set()
 
-    for url, page_text, headings, pslugs in pages:
+    service_page_word_counts: List[int] = []
+    service_pages_with_schema = 0
+    geo_examples: List[str] = []
+    blog_count = 0
+    for url, page_text, headings, pslugs, has_faq_schema, page_word_count, is_geo in pages:
         dedicated = _dedicated_buckets_for_page(url, pslugs, headings, page_text)
         mentioned = _mentioned_buckets_in_page(page_text)
         general = set()
@@ -410,6 +498,16 @@ def build_service_intelligence(
         all_dedicated_buckets |= dedicated
         all_mentioned_buckets |= mentioned
         all_general |= general
+        if dedicated:
+            service_page_word_counts.append(page_word_count)
+            if has_faq_schema:
+                service_pages_with_schema += 1
+        if is_geo:
+            if len(geo_examples) < 5:
+                geo_examples.append(url)
+        path_lower = (urlparse(url).path or "").lower()
+        if any(tok in path_lower for tok in ("/blog", "/article", "/news", "/insights")):
+            blog_count += 1
 
     # -- Phase 5: Also check sitemap URLs by slug (no fetch needed) -----
     # If a sitemap URL clearly matches a bucket via path, count it as dedicated
@@ -431,6 +529,16 @@ def build_service_intelligence(
         [CANONICAL_DISPLAY[b] for b in all_detected if b in CANONICAL_DISPLAY]
     )
     out["general_services_detected"] = sorted(list(all_general))[:10]
+    out["service_page_count"] = int(len(service_page_word_counts))
+    out["service_pages_with_faq_or_schema"] = int(service_pages_with_schema)
+    if service_page_word_counts:
+        out["avg_word_count_service_pages"] = int(sum(service_page_word_counts) / len(service_page_word_counts))
+        out["min_word_count_service_pages"] = int(min(service_page_word_counts))
+        out["max_word_count_service_pages"] = int(max(service_page_word_counts))
+    out["city_or_near_me_page_count"] = int(len(geo_examples))
+    out["has_multi_location_page"] = any("locations" in (urlparse(u).path or "").lower() for u in geo_examples)
+    out["geo_page_examples"] = geo_examples[:3]
+    out["blog_page_count"] = int(blog_count)
 
     # Missing = mentioned (on site or in reviews) but NO dedicated page
     review_buckets: Set[str] = set()

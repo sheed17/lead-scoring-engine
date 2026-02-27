@@ -1,19 +1,66 @@
 @import "tailwindcss";
 
 :root {
-  --background: #fafafa;
-  --foreground: #171717;
+  --bg-app: #f4f7fb;
+  --bg-card: #ffffff;
+  --border-default: #dde4ee;
+  --text-primary: #0b1220;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --accent: #0d9488;
+  --accent-ink: #ffffff;
+  --accent-soft: #ebfffb;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --space-section: 112px;
+  --space-block: 56px;
+  --max-content: 1200px;
+  --max-reading: 760px;
+  --shadow-card: 0 1px 1px rgba(15, 23, 42, 0.04), 0 8px 24px rgba(15, 23, 42, 0.04);
+  --shadow-elevated: 0 20px 48px rgba(15, 23, 42, 0.18);
+  --font-ui-stack: "Soehne", var(--font-ui-sans), "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  --background: var(--bg-app);
+  --foreground: var(--text-primary);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  --font-sans: var(--font-ui-stack);
+  --font-display: var(--font-ui-stack);
   --font-mono: var(--font-geist-mono);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+  font-family: var(--font-ui-stack);
+  letter-spacing: 0.01em;
+  line-height: 1.5;
+}
+
+.app-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+.app-elevated {
+  box-shadow: var(--shadow-elevated);
+}
+
+.app-link {
+  color: var(--accent);
+}
+
+.app-link:hover {
+  filter: brightness(0.9);
+}
+
+.display-title {
+  font-family: var(--font-ui-stack);
+  letter-spacing: -0.02em;
+  line-height: 1.06;
 }

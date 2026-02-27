@@ -71,10 +71,28 @@ def _category_norm(cat: Optional[str]) -> str:
 
 
 def _service_in_missing(high_ticket: List[str], missing: List[str]) -> Optional[str]:
-    """Return the first high-ticket service that appears in missing_high_value_pages (normalized match)."""
+    """Return prioritized missing high-ticket service (Implants first), then fallback match."""
     if not high_ticket or not missing:
         return None
     missing_norm = [str(m).strip().lower() for m in missing if m]
+    high_ticket_norm = [str(h).strip().lower() for h in high_ticket if h]
+
+    priorities = [
+        ("Implants", ("implant", "all-on-4", "all on 4")),
+        ("Orthodontics", ("orthodont", "invisalign", "braces", "aligner")),
+        ("Veneers", ("veneer",)),
+        ("Cosmetic", ("cosmetic", "whitening", "smile makeover")),
+        ("Sedation", ("sedation", "iv sedation", "nitrous", "oral sedation")),
+        ("Crowns", ("crown", "same day crown", "same-day crown")),
+        ("Sleep Apnea", ("sleep apnea", "snoring")),
+        ("Emergency", ("emergency", "urgent", "same day", "same-day")),
+    ]
+    for label, needles in priorities:
+        missing_hit = any(any(n in m for n in needles) for m in missing_norm)
+        high_ticket_hit = any(any(n in h for n in needles) for h in high_ticket_norm)
+        if missing_hit and high_ticket_hit:
+            return label
+
     for h in high_ticket:
         if not h or not isinstance(h, str):
             continue
@@ -207,6 +225,28 @@ def _normalize_intervention_step(item: Any, step_num: int) -> Optional[Dict[str,
     }
 
 
+def _replace_intervention_placeholders(
+    text: str,
+    practice_name: str,
+    city: str,
+    state: str,
+) -> str:
+    out = (text or "").strip()
+    if not out:
+        return out
+    city_state = ", ".join([p for p in [city, state] if p]).strip()
+    replacements = {
+        "[Practice]": practice_name or "the practice",
+        "[City]": city or city_state or "the local market",
+        "[State]": state or "",
+        "[Market]": city_state or city or "the local market",
+    }
+    for src, dst in replacements.items():
+        if dst:
+            out = out.replace(src, dst)
+    return out
+
+
 def generate_intervention_plan_from_intelligence(
     lead: Dict,
     objective_intelligence: Optional[Dict[str, Any]] = None,
@@ -232,12 +272,45 @@ def generate_intervention_plan_from_intelligence(
 
     strategic_gap = oi.get("strategic_gap")
     gap_text = json.dumps(strategic_gap, default=str) if strategic_gap and isinstance(strategic_gap, dict) else "None"
+    competitor_name = ""
+    if isinstance(strategic_gap, dict):
+        competitor_name = str(strategic_gap.get("competitor_name") or "").strip()
 
     service_intel = oi.get("service_intel") or {
         "high_ticket_detected": svc.get("high_ticket_procedures_detected") or [],
         "missing_high_value_pages": svc.get("missing_high_value_pages") or [],
     }
     service_text = json.dumps(service_intel, default=str)
+    missing_services = list(service_intel.get("missing_high_value_pages") or svc.get("missing_high_value_pages") or [])
+    missing_services = [str(x).strip() for x in missing_services if str(x).strip()]
+
+    practice_name = str(lead.get("name") or "").strip()
+
+    city = str(lead.get("city") or "").strip()
+    state = str(lead.get("state") or "").strip()
+    if not city:
+        address_components = lead.get("address_components") or []
+        if isinstance(address_components, list):
+            for comp_item in address_components:
+                if not isinstance(comp_item, dict):
+                    continue
+                comp_types = comp_item.get("types") or []
+                if "locality" in comp_types and not city:
+                    city = str(comp_item.get("long_name") or comp_item.get("short_name") or "").strip()
+                if "administrative_area_level_1" in comp_types and not state:
+                    state = str(comp_item.get("short_name") or comp_item.get("long_name") or "").strip()
+    if not city:
+        formatted = str(lead.get("formatted_address") or "").strip()
+        if formatted:
+            parts = [p.strip() for p in formatted.split(",") if p.strip()]
+            if len(parts) >= 2:
+                city = city or parts[-3] if len(parts) >= 3 else city
+                state_part = parts[-2] if len(parts) >= 2 else ""
+                if state_part and not state:
+                    state = state_part.split(" ")[0]
+    city_state = ", ".join([p for p in [city, state] if p]).strip() or "Unknown"
+    missing_services_text = ", ".join(missing_services) if missing_services else "None"
+    competitor_text = competitor_name or "None"
 
     conversion_profile = oi.get("conversion_profile") or {}
     conversion_text = json.dumps(conversion_profile, default=str) if conversion_profile else "—"
@@ -286,6 +359,15 @@ Rules:
 - If online booking exists, recommend optimizing the booking flow rather than adding booking.
 - Keep actions concise and tactical.
 - Maximum 3 steps.
+- Be specific to this practice: name actual missing service(s) and the city/market.
+- Do not use generic phrases like "high-value service" or "dedicated landing page" without naming the service.
+- When a strategic gap exists, reference the competitor by name where relevant.
+- Each action should be executable by an SEO for this exact practice and gap profile.
+- Never use placeholders such as [Practice], [City], [State], or [Market] in output.
+- Example specificity:
+  - "Create a dental implants landing page for [Practice] in [City] with before/after and financing options, and add LocalBusiness schema."
+  - "Add a dedicated Invisalign page for [Practice] and align existing Google Ads traffic to that page."
+- Write at this level of specificity, naming the practice and actual services.
 - Return JSON only.
 
 Each step must return:
@@ -297,7 +379,13 @@ Each step must return:
   "why": "<1 sentence directly tied to constraint or gap>"
 }"""
 
-    user = f"""Root Constraint:
+    user = f"""Practice Context:
+Practice: {practice_name or "Unknown"}
+City: {city_state}
+Missing service pages: {missing_services_text}
+Nearest competitor in gap: {competitor_text}
+
+Root Constraint:
 {root_text}
 
 Primary Growth Vector:
@@ -351,6 +439,18 @@ Generate exactly 3 steps. Return JSON only: a single JSON array of exactly 3 obj
         for i, item in enumerate(data[:3]):
             normalized = _normalize_intervention_step(item, i + 1)
             if normalized:
+                normalized["action"] = _replace_intervention_placeholders(
+                    normalized.get("action", ""),
+                    practice_name=practice_name,
+                    city=city,
+                    state=state,
+                )
+                normalized["why"] = _replace_intervention_placeholders(
+                    normalized.get("why", ""),
+                    practice_name=practice_name,
+                    city=city,
+                    state=state,
+                )
                 steps.append(normalized)
         return steps[:3]
     except (json.JSONDecodeError, TypeError, KeyError, IndexError) as e:

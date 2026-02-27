@@ -8,6 +8,9 @@ import { useAuth } from "@/lib/auth";
 
 const links = [
   { href: "/dashboard", label: "Dashboard" },
+  { href: "/ask", label: "Ask Neyma" },
+  { href: "/territory/new", label: "Run Territory" },
+  { href: "/lists", label: "Lists" },
   { href: "/diagnostic/new", label: "New Diagnostic" },
   { href: "/settings", label: "Settings" },
 ];
@@ -23,8 +26,6 @@ export default function Nav() {
       .then(() => setApiStatus("up"))
       .catch(() => setApiStatus("down"));
   }, []);
-
-  useEffect(() => { setMobileOpen(false); }, [pathname]);
 
   return (
     <header className="border-b border-zinc-200 bg-white px-6 py-3">
@@ -104,6 +105,7 @@ export default function Nav() {
                 <Link
                   key={l.href}
                   href={l.href}
+                  onClick={() => setMobileOpen(false)}
                   className={`rounded-md px-3 py-2 text-sm font-medium ${
                     active ? "bg-zinc-100 text-zinc-900" : "text-zinc-600 hover:bg-zinc-50"
                   }`}

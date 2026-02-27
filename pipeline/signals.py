@@ -720,6 +720,47 @@ def _detect_phone_in_html(html: str, html_lower: str, has_substantial_html: bool
     return None
 
 
+def _detect_phone_clickable(html_lower: str, has_substantial_html: bool) -> Optional[bool]:
+    if re.search(r'href\s*=\s*["\']tel:[^"\']+["\']', html_lower, re.IGNORECASE):
+        return True
+    if has_substantial_html:
+        return False
+    return None
+
+
+def _count_cta_elements(html_lower: str) -> int:
+    """
+    Count approximate CTA elements by text and class/id markers.
+    Deterministic, lightweight proxy (no DOM execution).
+    """
+    text_patterns = [
+        r'>\s*book(?:\s+now|\s+online|\s+appointment)?\s*<',
+        r'>\s*schedule(?:\s+now|\s+online|\s+appointment)?\s*<',
+        r'>\s*contact(?:\s+us)?\s*<',
+        r'>\s*call(?:\s+now|\s+us)?\s*<',
+        r'>\s*request(?:\s+appointment|\s+quote|\s+service)?\s*<',
+    ]
+    attr_patterns = [
+        r'class\s*=\s*["\'][^"\']*(?:cta|button|btn|appointment|book)[^"\']*["\']',
+        r'id\s*=\s*["\'][^"\']*(?:cta|button|btn|appointment|book)[^"\']*["\']',
+    ]
+    count = 0
+    for p in text_patterns + attr_patterns:
+        count += len(re.findall(p, html_lower, re.IGNORECASE))
+    return min(count, 100)
+
+
+def _detect_form_step_type(html_lower: str, has_substantial_html: bool) -> str:
+    if not has_substantial_html:
+        return "unknown"
+    # Heuristic: explicit step labels / wizard indicators imply multi-step.
+    if re.search(r'(multi[- ]?step|step\s*1|step\s*2|next\s*step|progress[- ]?bar|wizard)', html_lower, re.IGNORECASE):
+        return "multi_step"
+    if "<form" in html_lower:
+        return "single_step"
+    return "unknown"
+
+
 def _detect_address_in_html(html_lower: str, has_substantial_html: bool) -> Optional[bool]:
     """Detect physical address on page (schema or street pattern). Phase 0.1."""
     for pattern in ADDRESS_IN_HTML_PATTERNS:
@@ -942,6 +983,9 @@ def _analyze_html_content(html: str) -> Dict:
     # =========================================================================
     has_social_links, social_platforms = _detect_social_links(html_lower, has_substantial_html)
     has_phone_in_html = _detect_phone_in_html(html, html_lower, has_substantial_html)
+    phone_clickable = _detect_phone_clickable(html_lower, has_substantial_html)
+    cta_count = _count_cta_elements(html_lower) if has_substantial_html else 0
+    form_step_type = _detect_form_step_type(html_lower, has_substantial_html)
     has_address_in_html = _detect_address_in_html(html_lower, has_substantial_html)
     linkedin_company_url = _extract_linkedin_company_url(html)
     
@@ -965,6 +1009,9 @@ def _analyze_html_content(html: str) -> Dict:
         "has_social_links": has_social_links,
         "social_platforms": social_platforms if social_platforms else None,
         "has_phone_in_html": has_phone_in_html,
+        "phone_clickable": phone_clickable,
+        "cta_count": cta_count,
+        "form_single_or_multi_step": form_step_type,
         "has_address_in_html": has_address_in_html,
         "linkedin_company_url": linkedin_company_url,
         "_has_substantial_html": has_substantial_html,
@@ -1020,6 +1067,9 @@ def analyze_website(url: str) -> Dict:
         "has_social_links": None,
         "social_platforms": None,
         "has_phone_in_html": None,
+        "phone_clickable": None,
+        "cta_count": 0,
+        "form_single_or_multi_step": "unknown",
         "has_address_in_html": None,
         "linkedin_company_url": None,
     }
@@ -1064,6 +1114,9 @@ def analyze_website(url: str) -> Dict:
         signals["has_social_links"] = content_signals["has_social_links"]
         signals["social_platforms"] = content_signals["social_platforms"]
         signals["has_phone_in_html"] = content_signals["has_phone_in_html"]
+        signals["phone_clickable"] = content_signals["phone_clickable"]
+        signals["cta_count"] = content_signals["cta_count"]
+        signals["form_single_or_multi_step"] = content_signals["form_single_or_multi_step"]
         signals["has_address_in_html"] = content_signals["has_address_in_html"]
         signals["linkedin_company_url"] = content_signals["linkedin_company_url"]
 
@@ -1215,6 +1268,9 @@ def extract_signals(lead: Dict) -> Dict:
             "has_social_links": None,
             "social_platforms": None,
             "has_phone_in_html": None,
+            "phone_clickable": None,
+            "cta_count": 0,
+            "form_single_or_multi_step": "unknown",
             "has_address_in_html": None,
             "linkedin_company_url": None,
         }
@@ -1308,6 +1364,14 @@ def extract_signals(lead: Dict) -> Dict:
         "review_summary_text": review_context.get("review_summary"),
         "review_themes": review_context.get("review_themes") or [],
         "review_sample_snippets": review_context.get("review_sample_snippets") or [],
+        "review_sample_size": review_context.get("review_sample_size") or 0,
+        "review_service_mentions": review_context.get("service_mentions") or {},
+        "review_complaint_themes": review_context.get("complaint_themes") or {},
+        "review_intelligence": review_context,
+        # Observable conversion-structure details
+        "phone_clickable": website_signals.get("phone_clickable"),
+        "cta_count": website_signals.get("cta_count"),
+        "form_single_or_multi_step": website_signals.get("form_single_or_multi_step"),
     }
     
     return signals

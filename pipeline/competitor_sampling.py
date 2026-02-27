@@ -9,6 +9,7 @@ No percentiles. No LLM. Deterministic.
 import os
 import math
 import logging
+import statistics
 from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ def fetch_competitors_nearby(
         rating = p.get("rating")
         reviews = p.get("user_ratings_total") or 0
         return {
+            "place_id": p.get("place_id"),
             "name": p.get("name") or "",
             "rating": float(rating) if rating is not None else None,
             "reviews": int(reviews),
@@ -142,6 +144,16 @@ def _review_positioning_tier(review_ratio: Optional[float]) -> Optional[str]:
     return "Weak"
 
 
+def _review_positioning_label_from_tier(tier: Optional[str]) -> Optional[str]:
+    if not tier:
+        return None
+    if tier in ("Dominant", "Above Average"):
+        return "Above sample average"
+    if tier == "Competitive":
+        return "In line with sample average"
+    return "Below sample average"
+
+
 def build_competitive_snapshot(
     lead: Dict,
     competitors: List[Dict[str, Any]],
@@ -167,6 +179,12 @@ def build_competitive_snapshot(
         "competitor_summary": {},
         "competitive_context_summary": None,
         "confidence": 0.0,
+        "top_5_avg_reviews": None,
+        "competitor_median_reviews": None,
+        "target_gap_from_median": None,
+        "pct_competitors_with_blog": None,
+        "pct_competitors_with_booking": None,
+        "competitors_with_website_checked": 0,
     }
 
     if not competitors:
@@ -189,13 +207,15 @@ def build_competitive_snapshot(
         avg_rev = round(sum(counts) / len(counts), 1)
         out["avg_review_count"] = avg_rev
         review_ratio = (lead_count / avg_rev) if avg_rev > 0 else None
-        out["review_positioning_tier"] = _review_positioning_tier(review_ratio)
-        if lead_count > avg_rev:
-            out["review_positioning"] = "Above sample average"
-        elif lead_count < avg_rev:
-            out["review_positioning"] = "Below sample average"
-        else:
-            out["review_positioning"] = "In line with sample average"
+        tier = _review_positioning_tier(review_ratio)
+        out["review_positioning_tier"] = tier
+        out["review_positioning"] = _review_positioning_label_from_tier(tier)
+        top5 = sorted(counts, reverse=True)[:5]
+        out["top_5_avg_reviews"] = round(sum(top5) / len(top5), 1) if top5 else None
+        med = statistics.median(counts) if counts else None
+        out["competitor_median_reviews"] = round(float(med), 1) if med is not None else None
+        if med is not None:
+            out["target_gap_from_median"] = round(float(lead_count) - float(med), 1)
 
     avg_rating = 0.0
     if ratings:
@@ -243,6 +263,7 @@ def build_competitive_snapshot(
         dist = c.get("distance_miles")
         revs = c.get("reviews") or c.get("user_ratings_total") or 0
         entry = {
+            "place_id": c.get("place_id"),
             "name": c.get("name") or "",
             "rating": c.get("rating"),
             "reviews": revs,

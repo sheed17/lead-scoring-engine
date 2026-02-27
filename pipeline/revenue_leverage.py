@@ -6,6 +6,7 @@ estimated_revenue_asymmetry, highest_leverage_growth_vector. Feeds root bottlene
 """
 
 import logging
+import re
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -124,3 +125,82 @@ def compute_seo_sales_value_score(
     if conv == "Strong" and trust == "Strong" and lead.get("signal_runs_paid_ads") is True:
         score -= 20
     return max(0, min(100, score))
+
+
+def compute_territory_rank_key(diagnostic_response: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministic rank key for territory prospect lists.
+
+    Uses only existing diagnostic outputs: revenue upside, market/review position,
+    leverage/constraint signals, and opportunity profile.
+    """
+    brief = diagnostic_response.get("brief") or {}
+    exec_diag = brief.get("executive_diagnosis") or {}
+    market_position = brief.get("market_position") or {}
+    csg = brief.get("competitive_service_gap")
+    sg = brief.get("strategic_gap")
+    htg = brief.get("high_ticket_gaps") or {}
+
+    upside_text = str(exec_diag.get("modeled_revenue_upside") or "")
+    upside_value = _max_currency_from_text(upside_text)
+
+    score = 0.0
+    score += min(50.0, upside_value / 10000.0)
+
+    opp_text = str(exec_diag.get("opportunity_profile") or diagnostic_response.get("opportunity_profile") or "").lower()
+    if "high" in opp_text:
+        score += 12.0
+    elif "moderate" in opp_text or "medium" in opp_text:
+        score += 6.0
+    else:
+        score += 2.0
+
+    review_pos = str(diagnostic_response.get("review_position") or "").lower()
+    if "below" in review_pos:
+        score += 12.0
+    elif "in line" in review_pos:
+        score += 4.0
+
+    constraint = str(exec_diag.get("constraint") or diagnostic_response.get("constraint") or "").lower()
+    if any(x in constraint for x in ["visibility", "positioning", "capture", "trust"]):
+        score += 7.0
+
+    primary_lev = str(exec_diag.get("primary_leverage") or diagnostic_response.get("primary_leverage") or "").lower()
+    if any(x in primary_lev for x in ["service", "seo", "content", "organic", "landing"]):
+        score += 6.0
+
+    if isinstance(csg, dict) and (csg.get("service") or csg.get("competitor_name")):
+        score += 10.0
+    if isinstance(sg, dict) and sg.get("service"):
+        score += 8.0
+
+    missing_pages = htg.get("missing_landing_pages") or []
+    if isinstance(missing_pages, list):
+        score += min(8.0, float(len(missing_pages) * 2))
+
+    density = str(market_position.get("market_density") or diagnostic_response.get("market_density") or "").lower()
+    if density == "low":
+        score += 4.0
+    elif density == "moderate":
+        score += 2.0
+
+    return {
+        "score": round(max(0.0, min(100.0, score)), 2),
+        "upside_value": upside_value,
+        "upside_text": upside_text or None,
+    }
+
+
+def _max_currency_from_text(text: str) -> float:
+    if not text:
+        return 0.0
+    nums = re.findall(r"\$([\d,]+)", text)
+    if not nums:
+        return 0.0
+    values = []
+    for n in nums:
+        try:
+            values.append(float(n.replace(",", "")))
+        except ValueError:
+            continue
+    return max(values) if values else 0.0

@@ -56,6 +56,22 @@ uvicorn backend.main:app --reload
 - Health check: `GET /health`
 - Diagnostic: `POST /diagnostic` with body `{"business_name": "Example Dental", "city": "San Jose"}` (website optional)
 
+### Territory + lists workflow
+
+New workflow path (single-diagnostic remains unchanged):
+
+- `POST /territory` — start async Tier 1 territory scan `{ city, state?, vertical, limit?, filters? }`
+- `GET /territory/{scan_id}` — poll scan status/progress
+- `GET /territory/{scan_id}/results` — Tier 1 ranked prospect rows (Places + Place Details + single-homepage checks)
+- `POST /territory/prospects/{prospect_id}/ensure-brief` — run/attach Tier 2 full diagnostic on demand
+- `POST /lists`, `GET /lists` — create/list saved prospect lists
+- `POST /lists/{id}/members`, `GET /lists/{id}/members`, `DELETE /lists/{id}/members/{diagnostic_id}` — list membership
+- `POST /lists/{id}/rescan` — async re-scan current list members
+- `POST /diagnostics/{id}/outcome` — mark `contacted | closed_won | closed_lost`
+
+Tier 1 ranking is deterministic and lightweight: review count/rating plus basic website infrastructure checks (SSL, contact form, phone, viewport/schema).
+Tier 2 remains the existing full diagnostic pipeline and runs only when a user requests a brief or adds a prospect to a list.
+
 ### Run the frontend (Next.js)
 
 From the project root, start the API first, then:

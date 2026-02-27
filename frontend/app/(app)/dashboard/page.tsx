@@ -1,244 +1,206 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { listDiagnostics, deleteDiagnostic } from "@/lib/api";
-import type { DiagnosticListItem } from "@/lib/types";
+import { deleteDiagnostic, getOutcomesSummary, getRecentTerritoryScans, listDiagnostics } from "@/lib/api";
+import type { DiagnosticListItem, OutcomesSummaryResponse, TerritoryScanListItem } from "@/lib/types";
+import Button from "@/app/components/ui/Button";
+import Input from "@/app/components/ui/Input";
+import { Card, CardBody, CardHeader } from "@/app/components/ui/Card";
+import Badge from "@/app/components/ui/Badge";
+import { Table, THead, TH, TR, TD } from "@/app/components/ui/Table";
+import EmptyState from "@/app/components/ui/EmptyState";
+import { Skeleton } from "@/app/components/ui/Skeleton";
 
 const PAGE_SIZE = 10;
 
-export default function DashboardPage() {
-  const [items, setItems] = useState<DiagnosticListItem[]>([]);
-  const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [search, setSearch] = useState("");
-  const [page, setPage] = useState(0);
+function fmtDate(iso: string) {
+  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
 
-  async function load() {
-    setLoading(true);
-    try {
-      const data = await listDiagnostics(200, 0);
-      setItems(data.items);
-      setTotal(data.total);
-    } catch {
-      /* ignore */
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => { load(); }, []);
-
-  const filtered = useMemo(() => {
-    if (!search.trim()) return items;
-    const q = search.toLowerCase();
-    return items.filter(
-      (d) =>
-        d.business_name.toLowerCase().includes(q) ||
-        d.city.toLowerCase().includes(q) ||
-        (d.state ?? "").toLowerCase().includes(q) ||
-        (d.opportunity_profile ?? "").toLowerCase().includes(q),
-    );
-  }, [items, search]);
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const pageItems = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-
-  useEffect(() => { setPage(0); }, [search]);
-
-  async function handleDelete(id: number) {
-    if (!confirm("Delete this diagnostic?")) return;
-    try {
-      await deleteDiagnostic(id);
-      setItems((prev) => prev.filter((d) => d.id !== id));
-      setTotal((t) => t - 1);
-    } catch {
-      /* ignore */
-    }
-  }
-
-  function formatDate(iso: string) {
-    return new Date(iso).toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  }
-
-  const totalUpside = items.reduce((acc, d) => {
-    if (!d.modeled_revenue_upside) return acc;
-    const match = d.modeled_revenue_upside.match(/\$(\d[\d,]*)/);
-    if (match) return acc + parseInt(match[1].replace(/,/g, ""), 10);
-    return acc;
-  }, 0);
-
+function MiniStat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-h-[calc(100vh-8rem)] bg-zinc-50 text-zinc-900">
-      <main className="mx-auto max-w-5xl px-6 py-10">
-        {/* Header */}
-        <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
-            <p className="mt-1 text-sm text-zinc-500">{total} diagnostic{total !== 1 ? "s" : ""} saved</p>
-          </div>
-          <Link
-            href="/diagnostic/new"
-            className="rounded-lg bg-zinc-900 px-4 py-2 text-center text-sm font-medium text-white transition hover:bg-zinc-800"
-          >
-            New diagnostic
-          </Link>
-        </div>
-
-        {/* Stats row */}
-        <div className="mb-6 grid grid-cols-2 gap-4 sm:grid-cols-4">
-          <StatCard label="Total Diagnostics" value={String(total)} />
-          <StatCard label="Total Upside Identified" value={totalUpside > 0 ? `$${totalUpside.toLocaleString()}` : "—"} />
-          <StatCard label="Cities Covered" value={String(new Set(items.map((d) => d.city)).size)} />
-          <StatCard label="This Month" value={String(items.filter((d) => { const dt = new Date(d.created_at); const now = new Date(); return dt.getMonth() === now.getMonth() && dt.getFullYear() === now.getFullYear(); }).length)} />
-        </div>
-
-        {/* Search */}
-        <div className="mb-4">
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by business, city, or opportunity…"
-            className="w-full rounded-lg border border-zinc-300 bg-white px-4 py-2.5 text-sm focus:border-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-500 sm:max-w-sm"
-          />
-        </div>
-
-        {loading ? (
-          <div className="py-20 text-center text-sm text-zinc-400">Loading…</div>
-        ) : items.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-zinc-300 bg-white py-20 text-center">
-            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 text-zinc-400">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2v20M2 12h20" /></svg>
-            </div>
-            <p className="text-zinc-600 font-medium">No diagnostics yet</p>
-            <p className="mt-1 text-sm text-zinc-500">Run your first diagnostic to get started</p>
-            <Link href="/diagnostic/new" className="mt-4 inline-block rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-800">
-              Run diagnostic
-            </Link>
-          </div>
-        ) : filtered.length === 0 ? (
-          <div className="rounded-xl border border-zinc-200 bg-white py-12 text-center">
-            <p className="text-sm text-zinc-500">No results for &ldquo;{search}&rdquo;</p>
-          </div>
-        ) : (
-          <>
-            {/* Desktop table */}
-            <div className="hidden overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm md:block">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-zinc-100 bg-zinc-50 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">
-                    <th className="px-4 py-3">Business</th>
-                    <th className="px-4 py-3">City</th>
-                    <th className="px-4 py-3">Opportunity</th>
-                    <th className="px-4 py-3">Upside</th>
-                    <th className="px-4 py-3">Date</th>
-                    <th className="px-4 py-3 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pageItems.map((item) => (
-                    <tr key={item.id} className="border-b border-zinc-50 transition hover:bg-zinc-50/50">
-                      <td className="px-4 py-3 font-medium">
-                        <Link href={`/diagnostic/${item.id}`} className="hover:underline">
-                          {item.business_name}
-                        </Link>
-                      </td>
-                      <td className="px-4 py-3 text-zinc-600">{item.city}{item.state ? `, ${item.state}` : ""}</td>
-                      <td className="px-4 py-3">
-                        {item.opportunity_profile ? (
-                          <span className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700">
-                            {item.opportunity_profile}
-                          </span>
-                        ) : (
-                          <span className="text-zinc-400">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-zinc-600">{item.modeled_revenue_upside || "—"}</td>
-                      <td className="px-4 py-3 text-zinc-500">{formatDate(item.created_at)}</td>
-                      <td className="px-4 py-3 text-right">
-                        <Link href={`/diagnostic/${item.id}`} className="mr-3 text-zinc-600 hover:text-zinc-900">
-                          View
-                        </Link>
-                        <button onClick={() => handleDelete(item.id)} className="text-red-500 hover:text-red-700">
-                          Delete
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Mobile cards */}
-            <div className="space-y-3 md:hidden">
-              {pageItems.map((item) => (
-                <Link
-                  key={item.id}
-                  href={`/diagnostic/${item.id}`}
-                  className="block rounded-xl border border-zinc-200 bg-white p-4 shadow-sm transition hover:border-zinc-300"
-                >
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <p className="font-medium text-zinc-900">{item.business_name}</p>
-                      <p className="mt-0.5 text-sm text-zinc-500">{item.city}{item.state ? `, ${item.state}` : ""}</p>
-                    </div>
-                    {item.opportunity_profile && (
-                      <span className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700">
-                        {item.opportunity_profile}
-                      </span>
-                    )}
-                  </div>
-                  <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
-                    <span>{item.modeled_revenue_upside || "—"}</span>
-                    <span>{formatDate(item.created_at)}</span>
-                  </div>
-                </Link>
-              ))}
-            </div>
-
-            {/* Pagination */}
-            {totalPages > 1 && (
-              <div className="mt-6 flex items-center justify-between">
-                <p className="text-sm text-zinc-500">
-                  Showing {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, filtered.length)} of {filtered.length}
-                </p>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setPage((p) => Math.max(0, p - 1))}
-                    disabled={page === 0}
-                    className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm text-zinc-600 transition hover:bg-zinc-50 disabled:opacity-40"
-                  >
-                    Previous
-                  </button>
-                  <button
-                    onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
-                    disabled={page >= totalPages - 1}
-                    className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm text-zinc-600 transition hover:bg-zinc-50 disabled:opacity-40"
-                  >
-                    Next
-                  </button>
-                </div>
-              </div>
-            )}
-          </>
-        )}
-      </main>
+    <div className="rounded-2xl border border-[var(--border-default)] bg-white px-4 py-3">
+      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">{label}</p>
+      <p className="display-title mt-1 text-2xl font-bold text-[var(--text-primary)]">{value}</p>
     </div>
   );
 }
 
-function StatCard({ label, value }: { label: string; value: string }) {
+export default function DashboardPage() {
+  const [items, setItems] = useState<DiagnosticListItem[]>([]);
+  const [scans, setScans] = useState<TerritoryScanListItem[]>([]);
+  const [summary, setSummary] = useState<OutcomesSummaryResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(0);
+
+  useEffect(() => {
+    async function load() {
+      setLoading(true);
+      try {
+        const [diag, recent, out] = await Promise.all([
+          listDiagnostics(200, 0),
+          getRecentTerritoryScans(10),
+          getOutcomesSummary().catch(() => null),
+        ]);
+        setItems(diag.items);
+        setScans(recent.items);
+        setSummary(out);
+      } finally {
+        setLoading(false);
+      }
+    }
+    void load();
+  }, []);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter((d) => `${d.business_name} ${d.city} ${d.state || ""} ${d.opportunity_profile || ""}`.toLowerCase().includes(q));
+  }, [items, search]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const pageItems = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const cities = new Set(items.map((d) => d.city)).size;
+  const totalUpside = items.reduce((acc, d) => {
+    const m = d.modeled_revenue_upside?.match(/\$(\d[\d,]*)/);
+    return m ? acc + parseInt(m[1].replace(/,/g, ""), 10) : acc;
+  }, 0);
+
+  async function onDelete(id: number) {
+    if (!confirm("Delete this diagnostic?")) return;
+    await deleteDiagnostic(id);
+    setItems((prev) => prev.filter((x) => x.id !== id));
+  }
+
+  if (loading) {
+    return (
+      <div className="mx-auto max-w-[var(--max-content)] space-y-4">
+        <Skeleton className="h-28" />
+        <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-24" />)}</div>
+        <Skeleton className="h-72" />
+      </div>
+    );
+  }
+
   return (
-    <div className="rounded-xl border border-zinc-200 bg-white px-4 py-4 shadow-sm">
-      <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">{label}</p>
-      <p className="mt-1 text-xl font-semibold text-zinc-900">{value}</p>
+    <div className="mx-auto max-w-[var(--max-content)] space-y-4">
+      <Card className="overflow-hidden">
+        <CardBody className="bg-gradient-to-r from-[#0f172a] via-[#13233f] to-[#0b3f5f] p-6 text-white sm:p-8">
+          <div className="flex flex-wrap items-end justify-between gap-4">
+            <div className="max-w-2xl">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Operating Console</p>
+              <h1 className="display-title mt-2 text-3xl font-black leading-tight sm:text-5xl">Run your pipeline with one clear next action.</h1>
+              <p className="mt-3 text-sm text-slate-200 sm:text-base">Start with territory scans to prioritize markets, then use Ask Neyma for precise prospect intent queries.</p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Link href="/territory/new"><Button variant="primary" className="h-11 rounded-full bg-white px-5 text-slate-900 hover:bg-slate-100">Run territory scan</Button></Link>
+              <Link href="/ask"><Button className="h-11 rounded-full border-white/20 bg-white/10 px-5 text-white hover:bg-white/15">Ask Neyma</Button></Link>
+            </div>
+          </div>
+        </CardBody>
+      </Card>
+
+      {summary && (
+        <Card>
+          <CardHeader title="Pipeline Status" subtitle="Latest outreach state across all briefs." />
+          <CardBody className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+            <MiniStat label="Contacted" value={String(summary.contacted || 0)} />
+            <MiniStat label="Won" value={String(summary.closed_won || 0)} />
+            <MiniStat label="Lost" value={String(summary.closed_lost || 0)} />
+            <MiniStat label="Not contacted" value={String(summary.not_contacted || 0)} />
+            <MiniStat label="Won (30d)" value={String(summary.closed_this_month || 0)} />
+          </CardBody>
+        </Card>
+      )}
+
+      <div className="grid gap-4 xl:grid-cols-[1.15fr_2fr]">
+        <Card>
+          <CardHeader title="Next Best Action" subtitle="Single focus for this session." />
+          <CardBody className="space-y-4">
+            <div className="rounded-2xl border border-[var(--border-default)] bg-[#f7fbff] p-4">
+              <p className="text-sm font-semibold text-[var(--text-primary)]">Run a fresh territory scan for your next market.</p>
+              <p className="mt-1 text-sm text-[var(--text-muted)]">Then open Ask Neyma for exact filtering once the market shortlist is in place.</p>
+            </div>
+            <Link href="/territory/new"><Button variant="primary" className="w-full">Start with territory scan</Button></Link>
+            <Link href="/diagnostic/new" className="app-link block text-sm font-medium">Or run a single diagnostic</Link>
+          </CardBody>
+        </Card>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <MiniStat label="Total diagnostics" value={String(items.length)} />
+          <MiniStat label="Upside identified" value={totalUpside ? `$${totalUpside.toLocaleString()}` : "—"} />
+          <MiniStat label="Cities covered" value={String(cities)} />
+          <MiniStat label="Added this month" value={String(items.filter((d) => { const dt = new Date(d.created_at); const n = new Date(); return dt.getMonth() === n.getMonth() && dt.getFullYear() === n.getFullYear(); }).length)} />
+        </div>
+      </div>
+
+      <Card>
+        <CardHeader title="Your Briefs" subtitle="Search and work the current pipeline." action={<div className="w-72"><Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search business, city, opportunity..." /></div>} />
+        {items.length === 0 ? (
+          <CardBody>
+            <EmptyState
+              title="No diagnostics yet"
+              description="Run an Ask query or create a new diagnostic to start building pipeline."
+              action={<Link href="/territory/new"><Button variant="primary">Run territory</Button></Link>}
+            />
+          </CardBody>
+        ) : (
+          <>
+            <Table>
+              <THead><tr><TH>Business</TH><TH>City</TH><TH>Opportunity</TH><TH>Upside</TH><TH>Date</TH><TH className="text-right">Actions</TH></tr></THead>
+              <tbody>
+                {pageItems.map((item) => (
+                  <TR key={item.id}>
+                    <TD className="font-medium text-[var(--text-primary)]">{item.business_name}</TD>
+                    <TD>{item.city}{item.state ? `, ${item.state}` : ""}</TD>
+                    <TD>{item.opportunity_profile ? <Badge>{item.opportunity_profile}</Badge> : "—"}</TD>
+                    <TD>{item.modeled_revenue_upside || "—"}</TD>
+                    <TD>{fmtDate(item.created_at)}</TD>
+                    <TD className="text-right">
+                      <Link href={`/diagnostic/${item.id}`} className="app-link mr-3 font-medium">View brief</Link>
+                      <button onClick={() => void onDelete(item.id)} className="text-rose-600 hover:underline">Delete</button>
+                    </TD>
+                  </TR>
+                ))}
+              </tbody>
+            </Table>
+            {totalPages > 1 && (
+              <CardBody className="flex items-center justify-between border-t border-[var(--border-default)]">
+                <p className="text-sm text-[var(--text-muted)]">
+                  Showing {page * PAGE_SIZE + 1}-{Math.min((page + 1) * PAGE_SIZE, filtered.length)} of {filtered.length}
+                </p>
+                <div className="flex gap-2">
+                  <Button disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>Previous</Button>
+                  <Button disabled={page >= totalPages - 1} onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}>Next</Button>
+                </div>
+              </CardBody>
+            )}
+          </>
+        )}
+      </Card>
+
+      {scans.length > 0 && (
+        <Card>
+          <CardHeader title="Recent Territory Scans" subtitle="Jump back to completed and running scans." />
+          <Table>
+            <THead><tr><TH>Market</TH><TH>Vertical</TH><TH>Prospects</TH><TH>Status</TH><TH>Date</TH><TH className="text-right">Open</TH></tr></THead>
+            <tbody>
+              {scans.map((s) => (
+                <TR key={s.id}>
+                  <TD>{s.city || "—"}{s.state ? `, ${s.state}` : ""}</TD>
+                  <TD>{s.vertical || "—"}</TD>
+                  <TD>{s.prospects_count ?? Number((s.summary?.accepted as number) || 0)}</TD>
+                  <TD><Badge tone={s.status === "completed" ? "success" : "muted"}>{s.status}</Badge></TD>
+                  <TD>{fmtDate(s.created_at)}</TD>
+                  <TD className="text-right"><Link href={`/territory/${s.id}`} className="app-link font-medium">View results</Link></TD>
+                </TR>
+              ))}
+            </tbody>
+          </Table>
+        </Card>
+      )}
     </div>
   );
 }

@@ -165,6 +165,113 @@ def init_db() -> None:
                 FOREIGN KEY (job_id) REFERENCES jobs(id)
             );
 
+            CREATE TABLE IF NOT EXISTS territory_scans (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                job_id TEXT,
+                scan_type TEXT NOT NULL DEFAULT 'territory',
+                city TEXT,
+                state TEXT,
+                vertical TEXT,
+                limit_count INTEGER NOT NULL DEFAULT 20,
+                filters_json TEXT,
+                list_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                summary_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (job_id) REFERENCES jobs(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS territory_scan_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id TEXT NOT NULL,
+                diagnostic_id INTEGER NOT NULL,
+                place_id TEXT,
+                business_name TEXT,
+                city TEXT,
+                state TEXT,
+                previous_diagnostic_id INTEGER,
+                change_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (scan_id) REFERENCES territory_scans(id),
+                FOREIGN KEY (diagnostic_id) REFERENCES diagnostics(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS territory_prospects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                place_id TEXT NOT NULL,
+                business_name TEXT NOT NULL,
+                city TEXT,
+                state TEXT,
+                website TEXT,
+                rating REAL,
+                user_ratings_total INTEGER,
+                has_website INTEGER DEFAULT 0,
+                ssl INTEGER DEFAULT 0,
+                has_contact_form INTEGER DEFAULT 0,
+                has_phone INTEGER DEFAULT 0,
+                has_viewport INTEGER DEFAULT 0,
+                has_schema INTEGER DEFAULT 0,
+                rank_key REAL DEFAULT 0,
+                rank INTEGER,
+                review_position_summary TEXT,
+                tier1_snapshot_json TEXT,
+                diagnostic_id INTEGER,
+                full_brief_ready INTEGER DEFAULT 0,
+                ensure_job_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (scan_id) REFERENCES territory_scans(id),
+                FOREIGN KEY (diagnostic_id) REFERENCES diagnostics(id),
+                UNIQUE(scan_id, place_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS territory_tier1_cache (
+                place_id TEXT PRIMARY KEY,
+                details_json TEXT,
+                website_signals_json TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ask_places_cache (
+                cache_key TEXT PRIMARY KEY,
+                data_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ask_lightweight_cache (
+                place_id TEXT NOT NULL,
+                criterion_key TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (place_id, criterion_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS prospect_lists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS prospect_list_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                list_id INTEGER NOT NULL,
+                diagnostic_id INTEGER NOT NULL,
+                place_id TEXT,
+                business_name TEXT,
+                city TEXT,
+                state TEXT,
+                added_at TEXT NOT NULL,
+                UNIQUE(list_id, place_id),
+                FOREIGN KEY (list_id) REFERENCES prospect_lists(id),
+                FOREIGN KEY (diagnostic_id) REFERENCES diagnostics(id)
+            );
+
             CREATE TABLE IF NOT EXISTS review_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 place_id TEXT NOT NULL,
@@ -189,12 +296,32 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (diagnostic_id) REFERENCES diagnostics(id)
             );
+            CREATE TABLE IF NOT EXISTS brief_share_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                diagnostic_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                token TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                FOREIGN KEY (diagnostic_id) REFERENCES diagnostics(id)
+            );
             CREATE INDEX IF NOT EXISTS idx_outcomes_diagnostic ON diagnostic_outcomes(diagnostic_id);
             CREATE INDEX IF NOT EXISTS idx_predictions_place ON diagnostic_predictions(place_id);
+            CREATE INDEX IF NOT EXISTS idx_brief_share_diag ON brief_share_tokens(diagnostic_id);
+            CREATE INDEX IF NOT EXISTS idx_brief_share_token ON brief_share_tokens(token);
 
             CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
             CREATE INDEX IF NOT EXISTS idx_diagnostics_user ON diagnostics(user_id);
+            CREATE INDEX IF NOT EXISTS idx_scans_user ON territory_scans(user_id);
+            CREATE INDEX IF NOT EXISTS idx_scans_status ON territory_scans(status);
+            CREATE INDEX IF NOT EXISTS idx_scan_diagnostics_scan ON territory_scan_diagnostics(scan_id);
+            CREATE INDEX IF NOT EXISTS idx_territory_prospects_scan ON territory_prospects(scan_id);
+            CREATE INDEX IF NOT EXISTS idx_territory_prospects_place ON territory_prospects(place_id);
+            CREATE INDEX IF NOT EXISTS idx_territory_tier1_cache_updated ON territory_tier1_cache(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_ask_places_cache_updated ON ask_places_cache(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_ask_lightweight_cache_updated ON ask_lightweight_cache(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_list_members_list ON prospect_list_members(list_id);
         """)
         conn.commit()
         # Optional columns (migration for existing DBs)
@@ -1090,10 +1217,16 @@ def update_job_status(job_id: str, status: str, result: Optional[Dict] = None, e
     conn = _get_conn()
     try:
         if result is not None:
-            conn.execute(
-                "UPDATE jobs SET status = ?, result_json = ?, completed_at = ? WHERE id = ?",
-                (status, json.dumps(result, default=str), now, job_id),
-            )
+            if status in {"completed", "failed"}:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, result_json = ?, completed_at = ? WHERE id = ?",
+                    (status, json.dumps(result, default=str), now, job_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, result_json = ? WHERE id = ?",
+                    (status, json.dumps(result, default=str), job_id),
+                )
         elif error is not None:
             conn.execute(
                 "UPDATE jobs SET status = ?, error = ?, completed_at = ? WHERE id = ?",
@@ -1194,6 +1327,61 @@ def get_diagnostic(diagnostic_id: int, user_id: int) -> Optional[Dict]:
         conn.close()
 
 
+def get_diagnostic_any_user(diagnostic_id: int) -> Optional[Dict]:
+    """Return a single diagnostic by id, regardless of owner."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM diagnostics WHERE id = ?",
+            (diagnostic_id,),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("response_json"):
+            d["response"] = json.loads(d["response_json"])
+        if d.get("brief_json"):
+            d["brief"] = json.loads(d["brief_json"])
+        return d
+    finally:
+        conn.close()
+
+
+def create_brief_share_token(
+    diagnostic_id: int,
+    user_id: int,
+    token: str,
+    expires_at: Optional[str] = None,
+) -> None:
+    """Persist a share token for one diagnostic."""
+    now = datetime.now(timezone.utc).isoformat()
+    init_db()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO brief_share_tokens
+               (diagnostic_id, user_id, token, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (diagnostic_id, user_id, token, now, expires_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_share_token_record(token: str) -> Optional[Dict[str, Any]]:
+    """Return share token row if present."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM brief_share_tokens WHERE token = ?",
+            (token,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def delete_diagnostic(diagnostic_id: int, user_id: int) -> bool:
     """Delete a diagnostic owned by user_id. Returns True if deleted."""
     conn = _get_conn()
@@ -1217,6 +1405,763 @@ def count_diagnostics(user_id: int) -> int:
             (user_id,),
         ).fetchone()
         return row["cnt"] if row else 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Territory scans + ranked prospects
+# ---------------------------------------------------------------------------
+
+def create_territory_scan(
+    scan_id: str,
+    user_id: int,
+    job_id: Optional[str],
+    city: str,
+    state: Optional[str],
+    vertical: str,
+    limit_count: int,
+    filters: Optional[Dict[str, Any]] = None,
+    scan_type: str = "territory",
+    list_id: Optional[int] = None,
+) -> None:
+    """Create a new territory scan metadata row."""
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO territory_scans
+               (id, user_id, job_id, scan_type, city, state, vertical, limit_count,
+                filters_json, list_id, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                scan_id,
+                user_id,
+                job_id,
+                scan_type,
+                city,
+                state,
+                vertical,
+                limit_count,
+                json.dumps(filters or {}, default=str),
+                list_id,
+                "pending",
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_territory_scan_status(
+    scan_id: str,
+    status: str,
+    summary: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Update scan status and optional summary/error."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        if status in {"completed", "failed"}:
+            conn.execute(
+                """UPDATE territory_scans
+                   SET status = ?, summary_json = ?, error = ?, completed_at = ?
+                   WHERE id = ?""",
+                (status, json.dumps(summary, default=str) if summary else None, error, now, scan_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE territory_scans
+                   SET status = ?, summary_json = ?, error = ?
+                   WHERE id = ?""",
+                (status, json.dumps(summary, default=str) if summary else None, error, scan_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_territory_scan(scan_id: str, user_id: int) -> Optional[Dict[str, Any]]:
+    """Return scan metadata row for owner."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM territory_scans WHERE id = ? AND user_id = ?",
+            (scan_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        if out.get("filters_json"):
+            out["filters"] = json.loads(out["filters_json"])
+        if out.get("summary_json"):
+            out["summary"] = json.loads(out["summary_json"])
+        return out
+    finally:
+        conn.close()
+
+
+def list_territory_scans(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    """List recent territory scans for a user with prospect counts."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT ts.id, ts.city, ts.state, ts.vertical, ts.limit_count, ts.status,
+                      ts.created_at, ts.completed_at, ts.summary_json,
+                      COUNT(tp.id) AS prospects_count
+               FROM territory_scans ts
+               LEFT JOIN territory_prospects tp ON tp.scan_id = ts.id
+               WHERE ts.user_id = ? AND ts.scan_type = 'territory'
+               GROUP BY ts.id
+               ORDER BY ts.created_at DESC
+               LIMIT ?""",
+            (user_id, limit),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            d = dict(row)
+            if d.get("summary_json"):
+                d["summary"] = json.loads(d["summary_json"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def add_scan_diagnostic(
+    scan_id: str,
+    diagnostic_id: int,
+    place_id: Optional[str],
+    business_name: Optional[str],
+    city: Optional[str],
+    state: Optional[str],
+    previous_diagnostic_id: Optional[int] = None,
+    change: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Attach a diagnostic to a scan."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO territory_scan_diagnostics
+               (scan_id, diagnostic_id, place_id, business_name, city, state,
+                previous_diagnostic_id, change_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                scan_id,
+                diagnostic_id,
+                place_id,
+                business_name,
+                city,
+                state,
+                previous_diagnostic_id,
+                json.dumps(change, default=str) if change else None,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_scan_diagnostics(scan_id: str) -> List[Dict[str, Any]]:
+    """Return diagnostics linked to a scan with parsed diagnostic response."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT tsd.*, d.response_json, d.created_at AS diagnostic_created_at
+               FROM territory_scan_diagnostics tsd
+               JOIN diagnostics d ON d.id = tsd.diagnostic_id
+               WHERE tsd.scan_id = ?
+               ORDER BY tsd.id ASC""",
+            (scan_id,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            if d.get("response_json"):
+                d["response"] = json.loads(d["response_json"])
+            if d.get("change_json"):
+                d["change"] = json.loads(d["change_json"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Territory prospects (Tier 1 rows)
+# ---------------------------------------------------------------------------
+
+def save_territory_prospects(scan_id: str, user_id: int, prospects: List[Dict[str, Any]]) -> int:
+    """Insert/update Tier 1 prospect rows for a scan."""
+    if not prospects:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        for p in prospects:
+            conn.execute(
+                """INSERT INTO territory_prospects
+                   (scan_id, user_id, place_id, business_name, city, state, website,
+                    rating, user_ratings_total, has_website, ssl, has_contact_form,
+                    has_phone, has_viewport, has_schema, rank_key, rank,
+                    review_position_summary, tier1_snapshot_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(scan_id, place_id) DO UPDATE SET
+                      business_name = excluded.business_name,
+                      city = excluded.city,
+                      state = excluded.state,
+                      website = excluded.website,
+                      rating = excluded.rating,
+                      user_ratings_total = excluded.user_ratings_total,
+                      has_website = excluded.has_website,
+                      ssl = excluded.ssl,
+                      has_contact_form = excluded.has_contact_form,
+                      has_phone = excluded.has_phone,
+                      has_viewport = excluded.has_viewport,
+                      has_schema = excluded.has_schema,
+                      rank_key = excluded.rank_key,
+                      rank = excluded.rank,
+                      review_position_summary = excluded.review_position_summary,
+                      tier1_snapshot_json = excluded.tier1_snapshot_json,
+                      updated_at = excluded.updated_at""",
+                (
+                    scan_id,
+                    user_id,
+                    p.get("place_id"),
+                    p.get("business_name"),
+                    p.get("city"),
+                    p.get("state"),
+                    p.get("website"),
+                    p.get("rating"),
+                    p.get("user_ratings_total"),
+                    1 if p.get("has_website") else 0,
+                    1 if p.get("ssl") else 0,
+                    1 if p.get("has_contact_form") else 0,
+                    1 if p.get("has_phone") else 0,
+                    1 if p.get("has_viewport") else 0,
+                    1 if p.get("has_schema") else 0,
+                    float(p.get("rank_key") or 0),
+                    p.get("rank"),
+                    p.get("review_position_summary"),
+                    json.dumps(p, default=str),
+                    now,
+                    now,
+                ),
+            )
+        conn.commit()
+        return len(prospects)
+    finally:
+        conn.close()
+
+
+def list_territory_prospects(scan_id: str, user_id: int) -> List[Dict[str, Any]]:
+    """Return Tier 1 rows for a scan."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM territory_prospects
+               WHERE scan_id = ? AND user_id = ?
+               ORDER BY rank ASC, rank_key DESC, id ASC""",
+            (scan_id, user_id),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            d = dict(row)
+            if d.get("tier1_snapshot_json"):
+                d["tier1_snapshot"] = json.loads(d["tier1_snapshot_json"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def get_territory_prospect(prospect_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """Return one Tier 1 prospect row by id for user."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM territory_prospects WHERE id = ? AND user_id = ?",
+            (prospect_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("tier1_snapshot_json"):
+            d["tier1_snapshot"] = json.loads(d["tier1_snapshot_json"])
+        return d
+    finally:
+        conn.close()
+
+
+def set_territory_prospect_ensure_job(prospect_id: int, job_id: Optional[str]) -> None:
+    """Set/clear pending ensure-brief job on a prospect."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "UPDATE territory_prospects SET ensure_job_id = ?, updated_at = ? WHERE id = ?",
+            (job_id, now, prospect_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def link_territory_prospect_diagnostic(
+    prospect_id: int,
+    diagnostic_id: int,
+    full_brief_ready: bool = True,
+) -> None:
+    """Attach a full diagnostic to a Tier 1 prospect."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """UPDATE territory_prospects
+               SET diagnostic_id = ?, full_brief_ready = ?, ensure_job_id = NULL, updated_at = ?
+               WHERE id = ?""",
+            (diagnostic_id, 1 if full_brief_ready else 0, now, prospect_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_latest_diagnostic_by_place_id(user_id: int, place_id: str) -> Optional[Dict[str, Any]]:
+    """Return latest diagnostic row for a place_id/user, if any."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT id, place_id, business_name, city, state, created_at
+               FROM diagnostics
+               WHERE user_id = ? AND place_id = ?
+               ORDER BY created_at DESC
+               LIMIT 1""",
+            (user_id, place_id),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_tier1_cache(place_id: str) -> Optional[Dict[str, Any]]:
+    """Return cached Tier1 data for place_id."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT place_id, details_json, website_signals_json, updated_at FROM territory_tier1_cache WHERE place_id = ?",
+            (place_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "place_id": row["place_id"],
+            "details": json.loads(row["details_json"]) if row["details_json"] else None,
+            "website_signals": json.loads(row["website_signals_json"]) if row["website_signals_json"] else None,
+            "updated_at": row["updated_at"],
+        }
+    finally:
+        conn.close()
+
+
+def upsert_tier1_cache(
+    place_id: str,
+    details: Optional[Dict[str, Any]] = None,
+    website_signals: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Insert/update Tier1 cache row."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO territory_tier1_cache (place_id, details_json, website_signals_json, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(place_id) DO UPDATE SET
+                 details_json = COALESCE(excluded.details_json, territory_tier1_cache.details_json),
+                 website_signals_json = COALESCE(excluded.website_signals_json, territory_tier1_cache.website_signals_json),
+                 updated_at = excluded.updated_at""",
+            (
+                place_id,
+                json.dumps(details, default=str) if details is not None else None,
+                json.dumps(website_signals, default=str) if website_signals is not None else None,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_ask_places_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Return cached place candidates payload for an Ask query key."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT cache_key, data_json, updated_at FROM ask_places_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "cache_key": row["cache_key"],
+            "data": json.loads(row["data_json"]) if row["data_json"] else {},
+            "updated_at": row["updated_at"],
+        }
+    finally:
+        conn.close()
+
+
+def upsert_ask_places_cache(cache_key: str, data: Dict[str, Any]) -> None:
+    """Store/update ask places cache payload."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO ask_places_cache (cache_key, data_json, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(cache_key) DO UPDATE SET
+                 data_json = excluded.data_json,
+                 updated_at = excluded.updated_at""",
+            (cache_key, json.dumps(data, default=str), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_ask_lightweight_cache(place_id: str, criterion_key: str) -> Optional[Dict[str, Any]]:
+    """Return cached lightweight criterion check for a place."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT place_id, criterion_key, result_json, updated_at
+               FROM ask_lightweight_cache
+               WHERE place_id = ? AND criterion_key = ?""",
+            (place_id, criterion_key),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "place_id": row["place_id"],
+            "criterion_key": row["criterion_key"],
+            "result": json.loads(row["result_json"]) if row["result_json"] else {},
+            "updated_at": row["updated_at"],
+        }
+    finally:
+        conn.close()
+
+
+def upsert_ask_lightweight_cache(place_id: str, criterion_key: str, result: Dict[str, Any]) -> None:
+    """Store/update lightweight criterion result for a place."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO ask_lightweight_cache (place_id, criterion_key, result_json, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(place_id, criterion_key) DO UPDATE SET
+                 result_json = excluded.result_json,
+                 updated_at = excluded.updated_at""",
+            (place_id, criterion_key, json.dumps(result, default=str), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Prospect lists
+# ---------------------------------------------------------------------------
+
+def create_prospect_list(user_id: int, name: str) -> int:
+    """Create a named saved list for prospects."""
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "INSERT INTO prospect_lists (user_id, name, created_at) VALUES (?, ?, ?)",
+            (user_id, name, now),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def list_prospect_lists(user_id: int) -> List[Dict[str, Any]]:
+    """List all prospect lists and member counts."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT pl.id, pl.name, pl.created_at, COUNT(plm.id) AS members_count
+               FROM prospect_lists pl
+               LEFT JOIN prospect_list_members plm ON plm.list_id = pl.id
+               WHERE pl.user_id = ?
+               GROUP BY pl.id
+               ORDER BY pl.created_at DESC""",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_prospect_list(list_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """Return one list for owner."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, user_id, name, created_at FROM prospect_lists WHERE id = ? AND user_id = ?",
+            (list_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def upsert_list_member(
+    list_id: int,
+    diagnostic_id: int,
+    place_id: Optional[str],
+    business_name: Optional[str],
+    city: Optional[str],
+    state: Optional[str],
+) -> None:
+    """Add or update a list member by place_id uniqueness."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO prospect_list_members
+               (list_id, diagnostic_id, place_id, business_name, city, state, added_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(list_id, place_id) DO UPDATE SET
+                 diagnostic_id = excluded.diagnostic_id,
+                 business_name = excluded.business_name,
+                 city = excluded.city,
+                 state = excluded.state,
+                 added_at = excluded.added_at""",
+            (list_id, diagnostic_id, place_id, business_name, city, state, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def add_list_members(list_id: int, members: List[Dict[str, Any]]) -> int:
+    """Bulk upsert members for a list. Returns number of input members."""
+    for m in members:
+        upsert_list_member(
+            list_id=list_id,
+            diagnostic_id=int(m["diagnostic_id"]),
+            place_id=m.get("place_id"),
+            business_name=m.get("business_name"),
+            city=m.get("city"),
+            state=m.get("state"),
+        )
+    return len(members)
+
+
+def list_members_for_list(list_id: int) -> List[Dict[str, Any]]:
+    """Return current member rows joined to latest diagnostic payloads."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT plm.list_id, plm.diagnostic_id, plm.place_id, plm.business_name, plm.city, plm.state,
+                      plm.added_at, d.response_json, d.created_at AS diagnostic_created_at
+               FROM prospect_list_members plm
+               JOIN diagnostics d ON d.id = plm.diagnostic_id
+               WHERE plm.list_id = ?
+               ORDER BY plm.added_at DESC""",
+            (list_id,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            if d.get("response_json"):
+                d["response"] = json.loads(d["response_json"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def remove_list_member(list_id: int, diagnostic_id: int) -> bool:
+    """Delete member by diagnostic id within a list."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "DELETE FROM prospect_list_members WHERE list_id = ? AND diagnostic_id = ?",
+            (list_id, diagnostic_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Prospect outcome actions
+# ---------------------------------------------------------------------------
+
+def record_prospect_status(
+    diagnostic_id: int,
+    status: str,
+    note: Optional[str] = None,
+) -> None:
+    """Store list workflow outcome status as diagnostic_outcomes event."""
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {"status": status, "note": note}
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO diagnostic_outcomes
+               (diagnostic_id, outcome_type, outcome_json, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (diagnostic_id, "prospect_status", json.dumps(payload, default=str), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_latest_prospect_statuses(diagnostic_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """Return latest status payload for each diagnostic id."""
+    if not diagnostic_ids:
+        return {}
+    placeholders = ",".join("?" for _ in diagnostic_ids)
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            f"""SELECT t1.diagnostic_id, t1.outcome_json, t1.created_at
+                FROM diagnostic_outcomes t1
+                JOIN (
+                    SELECT diagnostic_id, MAX(created_at) AS max_created
+                    FROM diagnostic_outcomes
+                    WHERE outcome_type = 'prospect_status'
+                      AND diagnostic_id IN ({placeholders})
+                    GROUP BY diagnostic_id
+                ) t2
+                  ON t1.diagnostic_id = t2.diagnostic_id AND t1.created_at = t2.max_created
+                WHERE t1.outcome_type = 'prospect_status'""",
+            diagnostic_ids,
+        ).fetchall()
+        out: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            payload = json.loads(row["outcome_json"]) if row["outcome_json"] else {}
+            out[int(row["diagnostic_id"])] = {
+                "status": payload.get("status"),
+                "note": payload.get("note"),
+                "updated_at": row["created_at"],
+            }
+        return out
+    finally:
+        conn.close()
+
+
+def get_outcome_summary_for_user(user_id: int) -> Dict[str, int]:
+    """
+    Aggregate latest prospect outcome statuses for a user's diagnostics.
+    Returns contacted/closed_won/closed_lost/not_contacted/closed_this_month.
+    """
+    conn = _get_conn()
+    try:
+        total_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM diagnostics WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        total = int(total_row["cnt"]) if total_row else 0
+
+        rows = conn.execute(
+            """SELECT d.id AS diagnostic_id, latest.created_at AS updated_at, latest.outcome_json
+               FROM diagnostics d
+               JOIN (
+                    SELECT o1.diagnostic_id, o1.created_at, o1.outcome_json
+                    FROM diagnostic_outcomes o1
+                    JOIN (
+                         SELECT diagnostic_id, MAX(created_at) AS max_created
+                         FROM diagnostic_outcomes
+                         WHERE outcome_type = 'prospect_status'
+                         GROUP BY diagnostic_id
+                    ) o2
+                    ON o1.diagnostic_id = o2.diagnostic_id AND o1.created_at = o2.max_created
+                    WHERE o1.outcome_type = 'prospect_status'
+               ) latest ON latest.diagnostic_id = d.id
+               WHERE d.user_id = ?""",
+            (user_id,),
+        ).fetchall()
+
+        summary = {
+            "contacted": 0,
+            "closed_won": 0,
+            "closed_lost": 0,
+            "not_contacted": total,
+            "closed_this_month": 0,
+        }
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            payload = json.loads(row["outcome_json"]) if row["outcome_json"] else {}
+            status = str(payload.get("status") or "").strip().lower()
+            if status in ("contacted", "closed_won", "closed_lost"):
+                summary[status] += 1
+                summary["not_contacted"] = max(0, summary["not_contacted"] - 1)
+            if status == "closed_won" and row["updated_at"]:
+                try:
+                    ts = datetime.fromisoformat(str(row["updated_at"]))
+                    if (now - ts).days <= 30:
+                        summary["closed_this_month"] += 1
+                except (TypeError, ValueError):
+                    pass
+        return summary
+    finally:
+        conn.close()
+
+
+def list_outcomes_for_user(user_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+    """Return diagnostics with their latest prospect status for a user."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT d.id AS diagnostic_id, d.business_name, d.city, d.state, latest.created_at AS updated_at, latest.outcome_json
+               FROM diagnostics d
+               LEFT JOIN (
+                    SELECT o1.diagnostic_id, o1.created_at, o1.outcome_json
+                    FROM diagnostic_outcomes o1
+                    JOIN (
+                         SELECT diagnostic_id, MAX(created_at) AS max_created
+                         FROM diagnostic_outcomes
+                         WHERE outcome_type = 'prospect_status'
+                         GROUP BY diagnostic_id
+                    ) o2
+                    ON o1.diagnostic_id = o2.diagnostic_id AND o1.created_at = o2.max_created
+                    WHERE o1.outcome_type = 'prospect_status'
+               ) latest ON latest.diagnostic_id = d.id
+               WHERE d.user_id = ?
+               ORDER BY d.created_at DESC
+               LIMIT ?""",
+            (user_id, limit),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = json.loads(row["outcome_json"]) if row["outcome_json"] else {}
+            out.append(
+                {
+                    "diagnostic_id": int(row["diagnostic_id"]),
+                    "business_name": row["business_name"],
+                    "city": row["city"],
+                    "state": row["state"],
+                    "status": payload.get("status"),
+                    "note": payload.get("note"),
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return out
     finally:
         conn.close()
 

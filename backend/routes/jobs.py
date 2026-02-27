@@ -23,6 +23,7 @@ def get_job_status(job_id: str, request: Request):
     diagnostic_id = None
     if job["status"] == "completed" and job.get("result"):
         diagnostic_id = job["result"].get("diagnostic_id")
+    progress = job.get("result") if isinstance(job.get("result"), dict) else None
 
     return JobStatusResponse(
         job_id=job["id"],
@@ -31,4 +32,5 @@ def get_job_status(job_id: str, request: Request):
         completed_at=job.get("completed_at"),
         error=job.get("error"),
         diagnostic_id=diagnostic_id,
+        progress=progress,
     )

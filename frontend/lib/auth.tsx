@@ -24,21 +24,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     try {
       const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) setUser(JSON.parse(stored));
+      setUser(stored ? (JSON.parse(stored) as User) : null);
     } catch {
-      /* corrupted storage */
+      setUser(null);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }, []);
 
-  const login = useCallback(async (email: string, _password: string) => {
+  const login = useCallback(async (email: string, password: string) => {
+    void password;
     await new Promise((r) => setTimeout(r, 400));
     const u: User = { email, name: email.split("@")[0] };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(u));
     setUser(u);
   }, []);
 
-  const register = useCallback(async (name: string, email: string, _password: string) => {
+  const register = useCallback(async (name: string, email: string, password: string) => {
+    void password;
     await new Promise((r) => setTimeout(r, 400));
     const u: User = { email, name };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(u));
